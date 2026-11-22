@@ -3,19 +3,23 @@
 //
 //   #include "../../components/sound/modules/sound/SoundLink.h"
 //
-// and needs, in its module.yea, `import sound u64 api(u32 version) = 0`, plus a Volume and a Pitch knob per
-// sound (`setting float jump_volume 0 -40 6` and `setting float jump_pitch 0 -12 12`, under
-// `category Sound`). Sounds are declared inside the module's namespace, a file each from its Sounds/ folder:
+// and needs, in its module.yea, `import sound u64 api(u32 version) = 0`, plus knobs per sound under
+// `category Sound`: <name>_volume (dB) and <name>_pitch (semitones) always, the others of snd::kKnobSpecs
+// when it uses them (named <name>_<suffix>). Sounds are declared inside the module's namespace, a
+// file each from its Sounds/ folder:
 //
 //   SOUND(jump, "max 4 cooldown 0.05")
 //   #embed "Sounds/jump.wav"
 //   SOUND_END
 //
-// SOUND_AND adds a variation, SOUND_INTRO and SOUND_OUTRO a loop's intro and outro (each followed by its
-// #embed line). Then snd::play(jump), snd::play(jump, pos), and the rest below. Call snd::update() once
-// per update(): it brings the knobs to the playing sounds.
+// SOUND_AND adds a variation (one is picked at random per play), SOUND_INTRO and SOUND_OUTRO a loop's intro
+// and outro (each followed by its #embed line). SOUND_VERSION(jump, big) adds a version: the same files
+// with knobs of its own (jump_big_volume, ...), played as snd::play(jump_big). Then snd::play(jump),
+// snd::play(jump, pos), and the rest below. Call snd::update() once per update(): it brings the knobs to the
+// playing sounds.
 #pragma once
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,7 +29,7 @@
 
 namespace snd
 {
-constexpr uint32_t kApi = 1; // raised when Api or what it takes changes shape
+constexpr uint32_t kApi = 2; // raised when Api or what it takes changes shape (the sound module serves the older ones too)
 
 enum class Bus : uint32_t { Effects, Interface, Voice, Ambience, Music }; // snd::Bus::Music
 // How a voice stops: as its sound line says (Default), at once (a 5 ms ramp), fading over some seconds,
@@ -33,6 +37,49 @@ enum class Bus : uint32_t { Effects, Interface, Voice, Ambience, Music }; // snd
 enum Cut : uint32_t { Default, Now, Fade, Outro, Release };
 
 using Voice = uint32_t; // a playing sound; 0 is none. Fits a u32 table field and outlives code reloads.
+
+// A sound's knobs. Live ones the mixer applies as it plays (a change is heard at once, nothing is rendered);
+// baked ones render the sound's files again, once per set of values, and apply from the next play.
+enum Knob : uint32_t
+{
+    KnobVolume, KnobPitch, KnobPan, KnobLowpass, KnobHighpass,                                          // live
+    KnobSpeed, KnobBass, KnobTreble, KnobEcho, KnobReverb, KnobStart, KnobEnd, KnobFadeIn, KnobFadeOut, // baked
+    kKnobs
+};
+constexpr uint32_t kLive = KnobSpeed; // the first baked one
+struct KnobSpec
+{
+    const char* suffix; // the setting is <sound>_<suffix> (a version's: <sound>_<version>_<suffix>)
+    const char* title;
+    float       def, min, max; // max 0: open-ended
+};
+inline constexpr KnobSpec kKnobSpecs[kKnobs] = {
+    { "volume", "Volume", 0, -40, 6 },      // dB
+    { "pitch", "Pitch", 0, -12, 12 },       // semitones, like tape: higher is also quicker
+    { "pan", "Pan", 0, -1, 1 },             // left -1 to right 1
+    { "lowpass", "Muffle", 0, 0, 1 },       // a low-pass filter: 20 kHz down to 150 Hz
+    { "highpass", "Thin", 0, 0, 1 },        // a high-pass filter: 20 Hz up to 3 kHz
+    { "speed", "Speed", 1, 0.5f, 2 },       // tempo at the same pitch
+    { "bass", "Bass", 0, -12, 12 },         // dB, a shelf below 200 Hz
+    { "treble", "Treble", 0, -12, 12 },     // dB, a shelf above 4 kHz
+    { "echo", "Echo", 0, 0, 1 },            // repeats 0.28 s apart
+    { "reverb", "Reverb", 0, 0, 1 },        // a room, small to large
+    { "start", "Trim Start", 0, 0, 0 },     // seconds cut from its start
+    { "end", "Trim End", 0, 0, 0 },         // seconds cut from its end
+    { "fade_in", "Fade In", 0, 0, 0 },      // seconds
+    { "fade_out", "Fade Out", 0, 0, 0 },    // seconds
+};
+
+// A game's own values for a play, for knobs that are truly arbitrary (a voice per generated character).
+// Unset ones (NaN) are the sound's; set ones replace them.
+struct Knobs
+{
+    float volume = __builtin_nanf(""), pitch = __builtin_nanf(""), pan = __builtin_nanf(""), lowpass = __builtin_nanf(""),
+          highpass = __builtin_nanf(""), speed = __builtin_nanf(""), bass = __builtin_nanf(""), treble = __builtin_nanf(""),
+          echo = __builtin_nanf(""), reverb = __builtin_nanf(""), start = __builtin_nanf(""), end = __builtin_nanf(""),
+          fade_in = __builtin_nanf(""), fade_out = __builtin_nanf("");
+};
+static_assert(sizeof(Knobs) == sizeof(float) * kKnobs, "Knobs is kKnobs floats in Knob order");
 
 // What crosses to the sound module.
 struct File
@@ -46,16 +93,19 @@ struct Spec
 {
     const char* owner; // the module's folder name
     const char* name;
+    const char* version; // "" the sound itself, else one of its versions
     const char* options;
     const File* files;
     uint32_t    fileCount;
-    float       volume, pitch; // its knobs
+    uint32_t    knobMask; // the knobs its module declared (1 << Knob)
+    float       knobs[kKnobs];
 };
 struct Play
 {
-    float    at[3];
-    uint32_t flags; // 1 positional, 2 a sting (waits for the music's next beat)
-    float    volume, pitch; // added to its knobs and jitter
+    float        at[3];
+    uint32_t     flags; // 1 positional, 2 a sting (waits for the music's next beat)
+    float        volume, pitch; // added to its knobs and jitter
+    const float* knobs;         // kKnobs of the game's own (NaN: the sound's), or nullptr
 };
 // For a panel: one registered sound.
 struct Info
@@ -63,8 +113,11 @@ struct Info
     const char* name;
     const char* owner;
     const char* options;
-    uint32_t    id, bus, flags, files; // flags: 1 loop, 2 music, 4 streamed
+    const char* version;               // "" the sound itself, else a version of it
+    uint32_t    id, bus, flags, files; // flags: 1 loop, 2 music, 4 streamed (baked knobs don't apply)
     uint32_t    voices;                // playing now
+    uint32_t    of;                    // a version's sound (its id), else 0
+    uint32_t    knobMask;              // the knobs its module declared (1 << Knob)
 };
 // One file of a sound, for drawing it.
 struct Wave
@@ -83,7 +136,7 @@ struct Api
     void (*begin)(const char* owner);
     uint32_t (*define)(const Spec* spec, char* error, uint32_t errorBytes); // its id, or 0 and why
     void (*end)(const char* owner); // the owner's sounds not defined since begin() fade out and go
-    void (*knobs)(uint32_t sound, float volumeDb, float pitch);
+    void (*knobs)(uint32_t sound, const float* values); // kKnobs
     Voice (*play)(uint32_t sound, const Play* p);
     void (*stop)(Voice v, uint32_t cut, float seconds);
     void (*move)(Voice v, const float* at);
@@ -92,12 +145,17 @@ struct Api
     void (*music)(uint32_t sound); // 0: the music fades out
     void (*listener)(const float* at, const float* forward, const float* up);
     void (*bus)(uint32_t bus, float volumeDb);
+    void (*set)(Voice v, const float* values); // a playing voice's live knobs (kKnobs; NaN keeps one)
     // For a panel (the Sound Editor): every sound, in order, and a preview that plays through Pause.
     uint32_t (*count)(void);
     int (*info)(uint32_t index, Info* out);
-    int (*wave)(uint32_t sound, uint32_t file, Wave* out);
-    Voice (*preview)(uint32_t sound, uint32_t file);
+    int (*wave)(uint32_t sound, uint32_t file, Wave* out); // as its baked knobs render it
+    // One file alone on the Interface bus, from `from` seconds; flags 1 repeats it, 2 starts it held. Plays
+    // through Pause, outside cooldown, limits and the no-repeat rule. One at a time: a new one ends the last.
+    Voice (*preview)(uint32_t sound, uint32_t file, float from, uint32_t flags);
     float (*position)(Voice v); // seconds into the part playing
+    void (*hold)(Voice v, int on);   // held where it is (a 10 ms ramp), or on again
+    void (*repeat)(Voice v, int on); // loops its part, or plays it out
 };
 
 // ---- Declaring sounds (the SOUND macros) ----
@@ -130,19 +188,22 @@ struct AddPart
 
 struct Sound
 {
-    const char*  name;
-    const char*  options;
-    const float* volume; // its knobs
-    const float* pitch;
-    const char*  file; // where it was declared: its module's folder names its owner
-    uint32_t     id = 0;
-    float        sentVolume = 0, sentPitch = 0;
-    Sound*       next = nullptr;
-    Sound(const char* n, const char* o, const float* v, const float* p, const char* f) : name(n), options(o), volume(v), pitch(p), file(f)
+    const char*         name;
+    const char*         version; // "" the sound, else this version's name
+    const Sound*        of;      // a version's sound, else nullptr
+    const char*         options;
+    const float* const* knob;    // kKnobs settings (nullptr: not declared, its default)
+    const char*         file;    // where it was declared: its module's folder names its owner
+    uint32_t            id = 0;
+    float               sent[kKnobs] = {};
+    Sound*              next = nullptr;
+    Sound(const char* n, const char* v, const Sound* o, const char* opts, const float* const* k, const char* f)
+        : name(n), version(v), of(o), options(opts), knob(k), file(f)
     {
         next = detail::gSounds, detail::gSounds = this;
     }
     Sound(const Sound&) = delete;
+    float value(uint32_t k) const { return knob[k] ? *knob[k] : kKnobSpecs[k].def; }
 };
 
 namespace detail
@@ -173,19 +234,23 @@ inline void define(const Api* a, Sound* s, const char* owner)
         for (Part* p = gParts; p; p = p->next)
             if (p->sound == s && n < 40)
                 files[n++] = File{ p->kind, 0, p->bytes, p->size };
+        for (Part* p = gParts; p && !n && s->of; p = p->next) // a version with no files of its own: its sound's
+            if (p->sound == s->of && n < 40)
+                files[n++] = File{ p->kind, 0, p->bytes, p->size };
         for (uint32_t i = 0; i < n / 2; ++i) // declared order
         {
             const File t = files[i];
             files[i] = files[n - 1 - i], files[n - 1 - i] = t;
         }
-        const Spec spec = { owner, s->name, s->options, files, n, *s->volume, *s->pitch };
-        char       error[200] = "";
+        Spec spec = { owner, s->name, s->version, s->options, files, n, 0, {} };
+        for (uint32_t k = 0; k < kKnobs; ++k)
+            spec.knobs[k] = s->sent[k] = s->value(k), spec.knobMask |= s->knob[k] ? 1u << k : 0u;
+        char error[200] = "";
         s->id = a->define(&spec, error, sizeof(error));
-        s->sentVolume = *s->volume, s->sentPitch = *s->pitch;
         if (!s->id)
         {
             char message[300];
-            snprintf(message, sizeof(message), "sound %s: %s", s->name, error);
+            snprintf(message, sizeof(message), "sound %s%s%s: %s", s->name, s->version[0] ? " version " : "", s->version, error);
             yea::host()->fail(message); // reported and reverted, like a crash
         }
     }
@@ -224,21 +289,58 @@ inline const Api* api()
 #define SND_OPEN(k) namespace SND_CAT(file_, __LINE__) { static const uint32_t kKind = k; static const unsigned char bytes[] = {
 #define SND_CLOSE }; static ::snd::detail::AddPart part(&sound, kKind, bytes, sizeof bytes); }
 
+namespace detail
+{
+template<class... F> struct Over : F...
+{
+    using F::operator()...;
+};
+template<class... F> Over(F...) -> Over<F...>;
+} // namespace detail
+// settings.<m> when the module declared it, else nullptr (the knob's default).
+#define SND_OPT(m) ::snd::detail::Over{ [](auto& s, int) -> decltype(&s.m) { return &s.m; }, [](auto&, long) -> const float* { return nullptr; } }(settings, 0)
+// A sound's knob settings, in Knob order: volume and pitch must exist, the others may.
+#define SND_KNOBS(p)                                                                                                \
+    { &settings.p##_volume, &settings.p##_pitch, SND_OPT(p##_pan), SND_OPT(p##_lowpass), SND_OPT(p##_highpass),      \
+      SND_OPT(p##_speed), SND_OPT(p##_bass), SND_OPT(p##_treble), SND_OPT(p##_echo), SND_OPT(p##_reverb),             \
+      SND_OPT(p##_start), SND_OPT(p##_end), SND_OPT(p##_fade_in), SND_OPT(p##_fade_out) }
+
 // SOUND(name, "options"), then each file's #embed line, then SOUND_END. The handle is `name`; its knobs are
-// settings.name_volume and settings.name_pitch, which must exist.
+// settings.name_volume, settings.name_pitch (both must exist) and the others it declares.
 #define SOUND(name, options)                                                                                       \
     namespace name##_sound { extern ::snd::Sound sound; }                                                          \
     ::snd::Sound& name = name##_sound::sound;                                                                      \
     namespace name##_sound {                                                                                       \
-    static const char* const  kName = #name;                                                                       \
-    static const char* const  kOptions = options;                                                                  \
-    static const float* const kVolume = &settings.name##_volume;                                                   \
-    static const float* const kPitch = &settings.name##_pitch;                                                     \
+    static const char* const          kName = #name;                                                               \
+    static const char* const          kVersion = "";                                                               \
+    static const ::snd::Sound* const  kOf = nullptr;                                                               \
+    static const char* const          kOptions = options;                                                          \
+    static const float* const         kKnobs[] = SND_KNOBS(name);                                                  \
     SND_OPEN(0)
 #define SOUND_AND   SND_CLOSE SND_OPEN(0)
 #define SOUND_INTRO SND_CLOSE SND_OPEN(1)
 #define SOUND_OUTRO SND_CLOSE SND_OPEN(2)
-#define SOUND_END   SND_CLOSE ::snd::Sound sound(kName, kOptions, kVolume, kPitch, __FILE__); }
+#define SOUND_END   SND_CLOSE ::snd::Sound sound(kName, kVersion, kOf, kOptions, kKnobs, __FILE__); }
+
+// A version of a sound (after its SOUND_END, in the same file): the same files and options, knobs of its own
+// (settings.name_version_volume, ...), played as snd::play(name_version). Not a variation: the game chooses it.
+#define SOUND_VERSION(name, version)                                                                               \
+    namespace name##_##version##_sound {                                                                           \
+    static const float* const kKnobs[] = SND_KNOBS(name##_##version);                                              \
+    ::snd::Sound sound(#name, #version, &name##_sound::sound, name##_sound::kOptions, kKnobs, __FILE__);           \
+    }                                                                                                              \
+    ::snd::Sound& name##_##version = name##_##version##_sound::sound;
+// A version with files of its own (an edited copy of the sound's): its #embed lines follow, then SOUND_END.
+#define SOUND_VERSION_FILES(name, version)                                                                         \
+    namespace name##_##version##_sound { extern ::snd::Sound sound; }                                              \
+    ::snd::Sound& name##_##version = name##_##version##_sound::sound;                                              \
+    namespace name##_##version##_sound {                                                                           \
+    static const char* const          kName = #name;                                                               \
+    static const char* const          kVersion = #version;                                                         \
+    static const ::snd::Sound* const  kOf = &name##_sound::sound;                                                  \
+    static const char* const          kOptions = name##_sound::kOptions;                                           \
+    static const float* const         kKnobs[] = SND_KNOBS(name##_##version);                                      \
+    SND_OPEN(0)
 
 // ---- Playing them ----
 
@@ -252,7 +354,7 @@ inline Voice play(const Sound& s)
 inline Voice play(const Sound& s, yea_float3 at)
 {
     const Api* a = detail::api();
-    const Play p = { { at.x, at.y, at.z }, 1, 0, 0 };
+    const Play p = { { at.x, at.y, at.z }, 1, 0, 0, nullptr };
     return a ? a->play(s.id, &p) : 0;
 }
 inline Voice play(const Sound& s, yea_float2 at) { return play(s, yea_float3{ at.x, at.y, 0.0f }); }
@@ -260,20 +362,42 @@ inline Voice play(const Sound& s, yea_float2 at) { return play(s, yea_float3{ at
 inline Voice play(const Sound& s, float volumeDb, float pitch)
 {
     const Api* a = detail::api();
-    const Play p = { {}, 0, volumeDb, pitch };
+    const Play p = { {}, 0, volumeDb, pitch, nullptr };
     return a ? a->play(s.id, &p) : 0;
 }
 inline Voice play(const Sound& s, yea_float3 at, float volumeDb, float pitch)
 {
     const Api* a = detail::api();
-    const Play p = { { at.x, at.y, at.z }, 1, volumeDb, pitch };
+    const Play p = { { at.x, at.y, at.z }, 1, volumeDb, pitch, nullptr };
     return a ? a->play(s.id, &p) : 0;
+}
+// With the game's own values for some knobs (the rest are the sound's): a voice per generated character.
+// Live ones cost nothing; baked ones render the files once per set of values (kept while the view runs).
+inline Voice play(const Sound& s, const Knobs& k)
+{
+    const Api* a = detail::api();
+    const Play p = { {}, 0, 0, 0, &k.volume };
+    return a ? a->play(s.id, &p) : 0;
+}
+inline Voice play(const Sound& s, yea_float3 at, const Knobs& k)
+{
+    const Api* a = detail::api();
+    const Play p = { { at.x, at.y, at.z }, 1, 0, 0, &k.volume };
+    return a ? a->play(s.id, &p) : 0;
+}
+inline Voice play(const Sound& s, yea_float2 at, const Knobs& k) { return play(s, yea_float3{ at.x, at.y, 0.0f }, k); }
+// A playing voice's live knobs (volume, pitch, pan, lowpass, highpass), on top of nothing: they replace its
+// sound's. Baked ones apply from its next play.
+inline void set(Voice v, const Knobs& k)
+{
+    if (const Api* a = detail::api())
+        a->set(v, &k.volume);
 }
 // On the music's next beat (at once with no music).
 inline Voice sting(const Sound& s)
 {
     const Api* a = detail::api();
-    const Play p = { {}, 2, 0, 0 };
+    const Play p = { {}, 2, 0, 0, nullptr };
     return a ? a->play(s.id, &p) : 0;
 }
 // Its sound line's cut-off, or another: stop(v, snd::Now), stop(v, snd::Fade, 0.5), stop(v, snd::Release).
@@ -338,10 +462,15 @@ inline void update()
     if (!a)
         return;
     for (Sound* s = detail::gSounds; s; s = s->next)
-        if (s->id && (*s->volume != s->sentVolume || *s->pitch != s->sentPitch))
-        {
-            a->knobs(s->id, *s->volume, *s->pitch);
-            s->sentVolume = *s->volume, s->sentPitch = *s->pitch;
-        }
+    {
+        if (!s->id)
+            continue;
+        float v[kKnobs];
+        bool  changed = false;
+        for (uint32_t k = 0; k < kKnobs; ++k)
+            v[k] = s->value(k), changed |= v[k] != s->sent[k];
+        if (changed)
+            a->knobs(s->id, v), memcpy(s->sent, v, sizeof(v));
+    }
 }
 } // namespace snd

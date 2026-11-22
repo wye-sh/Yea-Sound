@@ -48,6 +48,34 @@ struct Env
     }
 };
 
+// A biquad (RBJ), transposed direct form II, per channel.
+struct Biquad
+{
+    float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+    float z[2][2] = {};
+    float amount = 0; // what the coefficients were made for
+    float run(int ch, float x)
+    {
+        const float y = b0 * x + z[ch][0];
+        z[ch][0] = b1 * x - a1 * y + z[ch][1];
+        z[ch][1] = b2 * x - a2 * y;
+        return y;
+    }
+};
+// Low-pass from 20 kHz (amount 0) down to 150 Hz (1), high-pass from 20 Hz up to 3 kHz, both logarithmic.
+void design(Biquad& f, float amount, bool high, float rate)
+{
+    f.amount = amount;
+    const float hz = high ? 20.0f * powf(150.0f, amount) : 20000.0f * powf(150.0f / 20000.0f, amount);
+    const float w = 2.0f * kPi * std::min(hz, 0.45f * rate) / rate, c = cosf(w), alpha = sinf(w) * 0.70710678f;
+    const float a0 = 1.0f + alpha;
+    if (high)
+        f.b0 = (1.0f + c) * 0.5f / a0, f.b1 = -(1.0f + c) / a0, f.b2 = f.b0;
+    else
+        f.b0 = (1.0f - c) * 0.5f / a0, f.b1 = (1.0f - c) / a0, f.b2 = f.b0;
+    f.a1 = -2.0f * c / a0, f.a2 = (1.0f - alpha) / a0;
+}
+
 struct Voice
 {
     bool     active = false;
@@ -78,12 +106,17 @@ struct Voice
     uint64_t tailAt = 0;
     bool     tailLoop = false;
     float    tailGain = 0;
+    float    k[LiveCount] = { NAN, NAN, NAN, NAN, NAN }; // its own live knobs (NaN: its sound's)
+    std::atomic<int>* users = nullptr;
+    Biquad   lowpass, highpass;
+    bool     lpOn = false, hpOn = false;
+    float    hold = 1, holdTarget = 1; // CmdHold: 0 held
 };
 
 struct Mixer
 {
     Voice    voices[kVoices];
-    float    defVolume[kDefs] = {}, defPitch[kDefs] = {};
+    float    defKnob[kDefs][LiveCount] = {};
     float    busDb[BusCount] = {};
     float    duckDb = 0;
     float    listener[3] = {}, right[3] = { 1, 0, 0 };
@@ -92,6 +125,8 @@ struct Mixer
     uint32_t rate = 48000;
     uint32_t music = 0; // slot+1 of the view's music
 } gMix;
+
+float knob(const Voice& v, uint32_t i) { return v.k[i] == v.k[i] ? v.k[i] : gMix.defKnob[v.def][i]; }
 
 bool     has(const Source& s) { return s.buffer || (s.stream >= 0 && s.stream < int(kStreams)); }
 uint32_t rateOf(const Source& s) { return s.buffer ? s.buffer->rate : gStreams[s.stream].rate; }
@@ -120,6 +155,8 @@ void endVoice(uint32_t i)
             s.stream = -1;
         }
     v.active = false;
+    if (v.users)
+        v.users->fetch_sub(1, std::memory_order_release), v.users = nullptr;
     if (gMix.music == i + 1)
         gMix.music = 0;
     if (v.def < kDefs)
@@ -182,6 +219,11 @@ void run(const Command& c)
             endVoice(c.slot);
         const bool loop = c.flags & FlagLoop;
         v = Voice{};
+        v.users = c.users;
+        if (c.flags & FlagHeld)
+            v.hold = v.holdTarget = 0;
+        for (uint32_t k = 0; k < LiveCount; ++k)
+            v.k[k] = c.k[k];
         v.active = true, v.gen = c.gen, v.def = c.def, v.src[0] = c.src[0], v.src[1] = c.src[1], v.src[2] = c.src[2];
         // A one-shot queued while there was no device is not played late.
         if (!loop && nowSeconds() - c.issued > 0.25)
@@ -227,7 +269,8 @@ void run(const Command& c)
     if (c.type == CmdKnobs)
     {
         if (c.def < kDefs)
-            M.defVolume[c.def] = c.volume, M.defPitch[c.def] = c.pitch;
+            for (uint32_t k = 0; k < LiveCount; ++k)
+                M.defKnob[c.def][k] = c.k[k] == c.k[k] ? c.k[k] : 0.0f;
         return;
     }
     if (c.type == CmdBus)
@@ -289,6 +332,16 @@ void run(const Command& c)
         memcpy(v.at, c.a, sizeof(v.at));
     else if (c.type == CmdTune)
         v.tuneDb = c.volume, v.tunePitch = c.pitch;
+    else if (c.type == CmdLive)
+    {
+        for (uint32_t k = 0; k < LiveCount; ++k)
+            if (c.k[k] == c.k[k])
+                v.k[k] = c.k[k];
+    }
+    else if (c.type == CmdHold)
+        v.holdTarget = (c.flags & 1) ? 0.0f : 1.0f;
+    else if (c.type == CmdLoop && v.seg == 1)
+        v.flags = (c.flags & 1) ? v.flags | FlagLoop : v.flags & ~uint32_t(FlagLoop);
 }
 
 // One frame of src at fractional position p (interpolated; at a loop's end, the next frame is its start).
@@ -404,6 +457,10 @@ bool advance(Voice& v, uint32_t n, float* out, float gl0, float gr0, float gl1, 
                     v.tailPos -= double(len);
                 v.tailGain = std::max(0.0f, v.tailGain - 1.0f / (0.01f * rate));
             }
+            if (v.hpOn)
+                l = v.highpass.run(0, l), r = v.highpass.run(1, r);
+            if (v.lpOn)
+                l = v.lowpass.run(0, l), r = v.lowpass.run(1, r);
             const float t = (k + 0.5f) / n;
             out[2 * k] += l * (gl0 + (gl1 - gl0) * t);
             out[2 * k + 1] += r * (gr0 + (gr1 - gr0) * t);
@@ -504,7 +561,7 @@ void render(float* out, uint32_t count)
             v.after = 0;
         }
         float pan = 0;
-        float g = dbToGain(v.volume + M.defVolume[v.def] + v.tuneDb + M.busDb[v.bus]);
+        float g = dbToGain(v.volume + knob(v, LiveVolume) + v.tuneDb + M.busDb[v.bus]);
         if (v.flags & FlagAt)
             g *= distanceGain(v, &pan);
         v.audible = g >= kSilent;
@@ -552,7 +609,14 @@ void render(float* out, uint32_t count)
             if (!v.active || v.after)
                 continue;
             const bool preview = v.flags & FlagPreview;
-            if ((held && !preview) || (v.leaving && v.env.t >= 1.0f))
+            // Held on its own (the editor's pause): ramps down over 10 ms and keeps its place.
+            const float h0 = v.hold;
+            if (v.hold != v.holdTarget)
+            {
+                const float step = n / (0.01f * rate);
+                v.hold = v.holdTarget > v.hold ? std::min(v.holdTarget, v.hold + step) : std::max(v.holdTarget, v.hold - step);
+            }
+            if ((held && !preview) || (v.leaving && v.env.t >= 1.0f) || (h0 <= 0.0f && v.hold <= 0.0f))
                 continue; // paused, or faded out for an unload: held where it is (and kept for the next version)
             uint32_t from = 0;
             if (v.delay)
@@ -572,26 +636,39 @@ void render(float* out, uint32_t count)
                     v.stopIn -= n - from;
             }
             float pan = 0;
-            float g = dbToGain(v.volume + M.defVolume[v.def] + v.tuneDb + M.busDb[v.bus] +
+            float g = dbToGain(v.volume + knob(v, LiveVolume) + v.tuneDb + M.busDb[v.bus] +
                                (v.bus == BusMusic || v.bus == BusAmbience ? M.duckDb : 0.0f));
             const bool at = v.flags & FlagAt;
             if (at)
                 g *= distanceGain(v, &pan);
-            const float pitchRatio = powf(2.0f, (v.pitch + M.defPitch[v.def] + v.tunePitch) / 12.0f);
+            const float panKnob = std::max(-1.0f, std::min(1.0f, knob(v, LivePan)));
+            pan = std::max(-1.0f, std::min(1.0f, pan + panKnob));
+            const float pitchRatio = powf(2.0f, (v.pitch + knob(v, LivePitch) + v.tunePitch) / 12.0f);
+            // Its filters: made again only when their amount changed.
+            const float lp = std::max(0.0f, std::min(1.0f, knob(v, LiveLowpass))), hp = std::max(0.0f, std::min(1.0f, knob(v, LiveHighpass)));
+            if (lp != v.lowpass.amount)
+                design(v.lowpass, lp, false, rate);
+            if (hp != v.highpass.amount)
+                design(v.highpass, hp, true, rate);
+            if (lp > 0.0f && !v.lpOn)
+                memset(v.lowpass.z, 0, sizeof(v.lowpass.z));
+            if (hp > 0.0f && !v.hpOn)
+                memset(v.highpass.z, 0, sizeof(v.highpass.z));
+            v.lpOn = lp > 0.0f, v.hpOn = hp > 0.0f;
             // Gains at the chunk's end: envelope after it, equal-power pan, the master and pause.
             Env after = v.env;
             after.t = std::min(1.0f, after.t + after.dt * (n - from));
             const float    e1 = after.value();
             const uint32_t ch = channelsOf(v.src[v.seg]);
             float          pl = 1, pr = 1;
-            if (at || ch == 1)
+            if (at || ch == 1 || panKnob != 0.0f)
             {
                 const float th = (pan + 1.0f) * kPi * 0.25f;
                 pl = cosf(th), pr = sinf(th);
                 if (ch == 2) // a stereo sound keeps its centre at full volume
                     pl = std::min(1.0f, pl * 1.4142f), pr = std::min(1.0f, pr * 1.4142f);
             }
-            const float m1 = g * M.master * (preview ? 1.0f : M.pause) * e1;
+            const float m1 = g * M.master * (preview ? 1.0f : M.pause) * v.hold * e1;
             const float gl1 = v.audible ? m1 * pl : 0.0f, gr1 = v.audible ? m1 * pr : 0.0f;
             // Going virtual, a voice is heard for one more chunk, ramping down: no click.
             const bool heard = v.audible || v.gl > 0.0f || v.gr > 0.0f;

@@ -67,6 +67,9 @@ SOUND_END
 SOUND(talk, "bus voice")
 #embed "Sounds/babble.wav"
 SOUND_END
+// Versions of the voice: the same file, each with knobs of its own (talk_robot_*, talk_giant_*), picked by the game.
+SOUND_VERSION(talk, robot)
+SOUND_VERSION(talk, giant)
 
 SOUND(calm, "music bpm 96")
 #embed "Sounds/calm.ogg"
@@ -89,7 +92,7 @@ struct Rgb
     float r, g, b;
 };
 const Rgb kBack = { 0.035f, 0.04f, 0.05f }, kPad = { 0.12f, 0.13f, 0.15f }, kText = { 0.85f, 0.87f, 0.9f }, kDim = { 0.45f, 0.47f, 0.5f };
-const Rgb kRows[] = { { 0.95f, 0.65f, 0.25f }, { 0.35f, 0.75f, 0.95f }, { 0.95f, 0.4f, 0.45f }, { 0.6f, 0.85f, 0.4f }, { 0.75f, 0.55f, 0.95f } };
+const Rgb kRows[] = { { 0.95f, 0.65f, 0.25f }, { 0.35f, 0.75f, 0.95f }, { 0.95f, 0.4f, 0.45f }, { 0.6f, 0.85f, 0.4f }, { 0.75f, 0.55f, 0.95f }, { 0.95f, 0.8f, 0.5f } };
 
 constexpr uint32_t kMaxQuads = 4096;
 YeaQuad            gQuads[kMaxQuads];
@@ -153,6 +156,7 @@ enum Action
     CutNow, CutFade, CutOutro, CutRelease,
     Calm, Chase, MusicOff, Win, Talk,
     Beacons, Walk,
+    Robot, Giant, Stranger,
     ActionCount
 };
 struct Pad
@@ -160,13 +164,14 @@ struct Pad
     const char* label;
     int         row, col;
 };
-const char* const kRowNames[] = { "ONE-SHOTS", "LOOPS", "CUT THE ENGINE", "MUSIC", "3D" };
+const char* const kRowNames[] = { "ONE-SHOTS", "LOOPS", "CUT THE ENGINE", "MUSIC", "3D", "VOICES" };
 const Pad         kPads[ActionCount] = {
     { "JUMP", 0, 0 },    { "STEP", 0, 1 },     { "COIN X6", 0, 2 }, { "LASER X12", 0, 3 }, { "BOOM", 0, 4 },
     { "ENGINE", 1, 0 },  { "CHARGE", 1, 1 },   { "HUM", 1, 2 },
     { "NOW", 2, 0 },     { "FADE 2S", 2, 1 },  { "OUTRO", 2, 2 },   { "RELEASE", 2, 3 },
     { "CALM", 3, 0 },    { "CHASE", 3, 1 },    { "OFF", 3, 2 },     { "WIN", 3, 3 },       { "TALK", 3, 4 },
     { "BEACONS", 4, 0 }, { "WALK", 4, 1 },
+    { "ROBOT", 5, 0 },   { "GIANT", 5, 1 },    { "STRANGER", 5, 2 },
 };
 
 // Layout, from the last frame's size.
@@ -177,10 +182,10 @@ float gSceneX = 0, gSceneY = 0, gScale = 1; // the scene's centre (pixels) and p
 void layout(float w, float h)
 {
     gW = w, gH = h;
-    gPx = floorf(fmaxf(2.0f, h / 360.0f));
+    gPx = floorf(fmaxf(2.0f, h / 420.0f));
     gPadW = 60.0f * gPx, gPadH = 13.0f * gPx, gGap = 3.0f * gPx;
     gLeft = 10.0f * gPx, gRowH = gPadH + 12.0f * gPx + gGap;
-    gTop = (h - 5.0f * gRowH) * 0.5f;
+    gTop = (h - 6.0f * gRowH) * 0.5f;
     const float panel = gLeft + 5.0f * (gPadW + gGap);
     gSceneX = panel + (w - panel) * 0.5f, gSceneY = h * 0.5f;
     gScale = fminf(w - panel, h) / 44.0f;
@@ -263,6 +268,19 @@ void press(int a)
         }
         break;
     case Walk: d.walking = !d.walking, d.step_in = 0; break;
+    case Robot: gLast[a] = snd::play(talk_robot); break;
+    case Giant: gLast[a] = snd::play(talk_giant); break;
+    case Stranger:
+    {
+        // A voice no knob holds: someone met for the first time, its values made now (pitch and pan live,
+        // speed rendered once for these values).
+        static uint32_t seed = 0x2545f491u;
+        auto            r = [] { return seed ^= seed << 13, seed ^= seed >> 17, seed ^= seed << 5, float(seed % 10000) / 10000.0f; };
+        snd::Knobs      k;
+        k.pitch = -6.0f + 14.0f * r(), k.speed = 0.75f + 0.6f * r(), k.pan = -0.8f + 1.6f * r();
+        gLast[a] = snd::play(talk, k);
+        break;
+    }
     }
 }
 

@@ -1,13 +1,14 @@
-// The Sound component's main-thread side: the registry of every sound games declared, the policy of each
-// play (cooldown, instance limit and stealing, variations without repeats, jitter), streamed files decoded
-// into rings, the device, and the voices kept across a swap of this module's own code. The mixer is
-// Mixer.cpp.
+// The Sound component's main-thread side: the registry of every sound games declared (and their versions),
+// the policy of each play (cooldown, instance limit and stealing, variations without repeats, jitter), the
+// baked knobs' renders (Bake.cpp), streamed files decoded into rings, the device, the editor's preview, and
+// the voices kept across a swap of this module's own code. The mixer is Mixer.cpp.
 //
 // Exports run inside the calling module's guard and heap (Yea charges a call to its caller), so nothing
 // here allocates through the host: every buffer is this module's own malloc, freed in unload() at the
 // latest.
 #include "yea_sound.h"
 
+#include "Bake.h"
 #include "Miniaudio.h"
 #include "Mixer.h"
 #include "SoundLink.h"
@@ -88,18 +89,22 @@ bool openDecoder(const void* bytes, size_t size, uint32_t channels, ma_decoder* 
     return ma_decoder_init_memory(bytes, size, &c, d) == MA_SUCCESS;
 }
 
-void addPeaks(Clip* c, const float* frames, uint64_t count, uint64_t first, uint64_t total)
+void addPeaks(float* peaks, uint32_t channels, const float* frames, uint64_t count, uint64_t first, uint64_t total)
 {
     for (uint64_t i = 0; i < count; ++i)
     {
         const uint64_t k = std::min<uint64_t>(kPeaks - 1, (first + i) * kPeaks / std::max<uint64_t>(1, total));
-        for (uint32_t ch = 0; ch < c->channels; ++ch)
+        for (uint32_t ch = 0; ch < channels; ++ch)
         {
-            const float x = frames[i * c->channels + ch];
-            c->peaks[2 * k] = std::min(c->peaks[2 * k], x);
-            c->peaks[2 * k + 1] = std::max(c->peaks[2 * k + 1], x);
+            const float x = frames[i * channels + ch];
+            peaks[2 * k] = std::min(peaks[2 * k], x);
+            peaks[2 * k + 1] = std::max(peaks[2 * k + 1], x);
         }
     }
+}
+void addPeaks(Clip* c, const float* frames, uint64_t count, uint64_t first, uint64_t total)
+{
+    addPeaks(c->peaks, c->channels, frames, count, first, total);
 }
 
 // The clip for a file's bytes (made now when new): decoded whole, or copied to stream when long.
@@ -183,17 +188,22 @@ struct Opts
 };
 enum : uint32_t { StealAuto, StealOldest, StealFarthest, StealQuietest, StealNone };
 
+struct BakeSet;
 struct Def
 {
     bool     used, retired, confirmed;
-    char     owner[64], name[64], options[256];
-    uint64_t key; // owner, name, options and every file's content: the same key is the same sound
+    char     owner[64], name[64], version[64], options[256];
+    uint64_t key; // owner, name, version, options and every file's content: the same key is the same sound
     Opts     o;
     Clip*    variations[kVariations];
     uint32_t variationCount;
     Clip*    intro;
     Clip*    outro;
-    float    volumeDb, pitch;
+    float    knobs[snd::kKnobs];
+    uint32_t knobMask; // the knobs its module declared
+    BakeSet* bake;     // its files rendered with its baked knobs; nullptr: as they are
+    bool     bakeDirty;
+    double   bakeAt;
     double   lastPlay;
     uint32_t recent[8], recentCount; // the last variations played, newest first
     uint64_t order;                  // when it was first defined
@@ -327,6 +337,97 @@ bool parse(const char* text, bool hasIntroOrOutro, Opts* o, char* error, uint32_
     if (!set[SCooldown] && !o->loop && !o->music)
         o->cooldown = 0.03f;
     return true;
+}
+
+// A sound's files in order: its variations, then its intro, then its outro.
+constexpr uint32_t kFiles = kVariations + 2;
+const Clip* fileOf(const Def& d, uint32_t file, uint32_t* kind)
+{
+    if (file < d.variationCount)
+        return *kind = 0, d.variations[file];
+    file -= d.variationCount;
+    if (d.intro && file == 0)
+        return *kind = 1, d.intro;
+    file -= d.intro ? 1 : 0;
+    if (d.outro && file == 0)
+        return *kind = 2, d.outro;
+    return nullptr;
+}
+uint32_t fileCount(const Def& d) { return d.variationCount + (d.intro ? 1 : 0) + (d.outro ? 1 : 0); }
+
+// ---- Bake sets: a sound's files rendered with one set of baked knob values (its own, or a game's at play) ----
+
+constexpr uint32_t kBakeSets = 128;
+struct BakeSet
+{
+    uint32_t         def;
+    uint64_t         defKey, valuesKey;
+    float            values[kBaked];
+    std::atomic<int> users; // voices playing it (the mixer lets go at their end)
+    double           lastUsed;
+    Buffer           files[kFiles];
+    bool             done[kFiles]; // false: that file plays as it is (a streamed one)
+    float            seconds[kFiles];
+    float            peaks[kFiles][kPeaks * 2];
+};
+BakeSet* gBakes[kBakeSets];
+
+void freeBake(uint32_t i)
+{
+    for (Buffer& b : gBakes[i]->files)
+        free(b.frames);
+    free(gBakes[i]);
+    gBakes[i] = nullptr;
+}
+
+// Def i's files with baked `values` (kBaked): found, or rendered now. nullptr when they need no render, or
+// when there is no room or memory (then *failed).
+BakeSet* bakeFor(uint32_t i, const float* values, bool* failed)
+{
+    *failed = false;
+    if (!baked(values))
+        return nullptr;
+    const Def&     d = gDefs[i];
+    const uint64_t vk = fnv(values, sizeof(float) * kBaked);
+    int            fresh = -1, oldest = -1;
+    for (uint32_t k = 0; k < kBakeSets; ++k)
+    {
+        BakeSet* b = gBakes[k];
+        if (!b)
+        {
+            fresh = fresh < 0 ? int(k) : fresh;
+            continue;
+        }
+        if (b->def == i && b->defKey == d.key && b->valuesKey == vk && !memcmp(b->values, values, sizeof(b->values)))
+            return b->lastUsed = nowSeconds(), b;
+        if (b->users.load(std::memory_order_acquire) <= 0 && gDefs[b->def].bake != b && (oldest < 0 || b->lastUsed < gBakes[oldest]->lastUsed))
+            oldest = int(k);
+    }
+    if (fresh < 0 && oldest >= 0)
+        freeBake(uint32_t(oldest)), fresh = oldest;
+    BakeSet* b = fresh < 0 ? nullptr : (BakeSet*)calloc(1, sizeof(BakeSet));
+    if (!b)
+        return *failed = true, nullptr;
+    b->def = i, b->defKey = d.key, b->valuesKey = vk, b->lastUsed = nowSeconds();
+    memcpy(b->values, values, sizeof(b->values));
+    for (uint32_t f = 0; f < fileCount(d) && f < kFiles; ++f)
+    {
+        uint32_t    kind = 0;
+        const Clip* c = fileOf(d, f, &kind);
+        if (!c || c->streamed)
+            continue;
+        const uint32_t role = kind == 1 ? BakeFirst : kind == 2 ? BakeLast : d.o.loop ? BakeLoop : BakeFirst | BakeLast;
+        if (!bake(c->buffer, values, role, &b->files[f]))
+        {
+            gBakes[fresh] = b, freeBake(uint32_t(fresh));
+            return *failed = true, nullptr;
+        }
+        b->done[f] = true;
+        b->seconds[f] = float(double(b->files[f].count) / std::max(1u, b->files[f].rate));
+        addPeaks(b->peaks[f], b->files[f].channels, b->files[f].frames, b->files[f].count, 0, b->files[f].count);
+    }
+    gBakes[fresh] = b;
+    return b;
 }
 
 void releaseDef(uint32_t i)
@@ -570,16 +671,29 @@ int takeStream(const Clip* c, bool loop, uint64_t seek)
 }
 
 Source sourceOf(const Clip* c) { return c && !c->streamed ? Source{ &c->buffer, -1 } : Source{}; }
+// File f of def d as it plays: its render in bake set b, else the file as it is.
+Source sourceOf(const Def& d, const BakeSet* b, uint32_t f)
+{
+    uint32_t    kind = 0;
+    const Clip* c = fileOf(d, f, &kind);
+    if (b && f < kFiles && b->done[f])
+        return Source{ &b->files[f], -1 };
+    return sourceOf(c);
+}
 
-// Sends a play for def `id` in `slot`. The caller has checked the limits.
-snd::Voice start(uint32_t id, uint32_t slot, uint32_t gen, uint32_t variation, uint32_t flags, const float* at, float volume, float pitch,
-            uint32_t seg, double pos, float fadeIn)
+// Sends a play for def `id` in `slot`, its body file `file` (a variation; a preview: any file). The caller has
+// checked the limits. b: the bake set it plays (or nullptr); knobs: the game's own live values (or nullptr).
+snd::Voice start(uint32_t id, uint32_t slot, uint32_t gen, uint32_t file, uint32_t flags, const float* at, float volume, float pitch,
+            uint32_t seg, double pos, float fadeIn, BakeSet* b, const float* knobs)
 {
     Def&          d = gDefs[id - 1];
     const double  t = nowSeconds();
     Command       c = {};
     const bool    preview = flags & FlagPreview;
-    Clip* const   body = d.variations[variation];
+    uint32_t      kind = 0;
+    const Clip*   body = fileOf(d, file, &kind);
+    if (!body)
+        return 0;
     c.type = CmdPlay, c.slot = slot, c.def = id - 1, c.gen = gen;
     c.bus = uint8_t(preview ? BusInterface : d.o.bus), c.priority = uint8_t(preview ? 2 : d.o.priority);
     c.cut = uint8_t(d.o.cut), c.fade = d.o.cut == CutFade ? d.o.cutFade : kRamp;
@@ -592,9 +706,15 @@ snd::Voice start(uint32_t id, uint32_t slot, uint32_t gen, uint32_t variation, u
     c.switchAt = d.o.switchAt, c.crossfade = d.o.crossfade;
     c.music = gMusic && alive(gMusic - 1) ? gMusic : 0, c.musicGen = gMusicGen;
     c.issued = t, c.seg = seg, c.pos = pos;
-    if (!preview)
-        c.src[0] = sourceOf(d.intro), c.src[2] = sourceOf(d.outro);
-    c.src[1] = sourceOf(body);
+    for (uint32_t k = 0; k < LiveCount; ++k)
+        c.k[k] = knobs ? knobs[k] : NAN;
+    if (!preview && d.intro)
+        c.src[0] = sourceOf(d, b, d.variationCount);
+    if (!preview && d.outro)
+        c.src[2] = sourceOf(d, b, d.variationCount + (d.intro ? 1 : 0));
+    c.src[1] = sourceOf(d, b, file);
+    if (b)
+        c.users = &b->users, b->users.fetch_add(1, std::memory_order_relaxed), b->lastUsed = t;
     int stream = -1;
     if (body->streamed)
     {
@@ -610,12 +730,14 @@ snd::Voice start(uint32_t id, uint32_t slot, uint32_t gen, uint32_t variation, u
     {
         if (stream >= 0)
             gStreams[stream].state.store(StreamClose, std::memory_order_release); // topUp frees it
+        if (b)
+            b->users.fetch_sub(1, std::memory_order_relaxed);
         return 0;
     }
     gDefVoices[id - 1].fetch_add(1, std::memory_order_relaxed);
     Mirror& m = gMirror[slot];
     m = Mirror{};
-    m.used = true, m.gen = gen, m.def = id - 1, m.variation = variation, m.started = t, m.positional = at != nullptr, m.preview = preview;
+    m.used = true, m.gen = gen, m.def = id - 1, m.variation = file, m.started = t, m.positional = at != nullptr, m.preview = preview;
     if (at)
         memcpy(m.at, at, sizeof(m.at));
     return (gen << 8) | slot;
@@ -693,7 +815,24 @@ snd::Voice playDef(uint32_t sound, const snd::Play* p)
     const float volume = (p ? p->volume : 0.0f) - random01() * d.o.jitterVolume;
     const float pitch = (p ? p->pitch : 0.0f) + (random01() * 2.0f - 1.0f) * d.o.jitterPitch;
     const uint32_t flags = (positional ? FlagAt : 0) | (p && (p->flags & 2) ? FlagSting : 0);
-    const snd::Voice v = start(sound, uint32_t(slot), nextGen(uint32_t(slot)), pick, flags, at, volume, pitch, 0, 0, 0);
+    // The game's own values: live ones go with the voice; baked ones play a render made for them.
+    BakeSet*     b = d.bake;
+    const float* live = p ? p->knobs : nullptr;
+    if (live)
+    {
+        float v[kBaked];
+        bool  own = false;
+        for (uint32_t k = 0; k < kBaked; ++k)
+        {
+            const float x = live[snd::kLive + k];
+            own |= x == x;
+            v[k] = x == x ? x : d.knobs[snd::kLive + k];
+        }
+        bool failed = false;
+        if (own)
+            b = bakeFor(sound - 1, v, &failed), b = failed ? d.bake : b;
+    }
+    const snd::Voice v = start(sound, uint32_t(slot), nextGen(uint32_t(slot)), pick, flags, at, volume, pitch, 0, 0, 0, b, live);
     if (!v)
         return 0;
     if (count > 1)
@@ -717,7 +856,7 @@ void resume(uint32_t id)
             continue;
         }
         const snd::Voice v = start(id, p.slot, p.gen, p.variation, p.flags & (FlagAt | FlagSting), (p.flags & FlagAt) ? p.at : nullptr, 0, 0,
-                              p.seg, p.pos, 0.02f);
+                              p.seg, p.pos, 0.02f, gDefs[id - 1].bake, nullptr);
         if (v)
         {
             Command c = {};
@@ -733,8 +872,23 @@ void resume(uint32_t id)
 void sendKnobs(uint32_t id)
 {
     Command c = {};
-    c.type = CmdKnobs, c.def = id - 1, c.volume = gDefs[id - 1].volumeDb, c.pitch = gDefs[id - 1].pitch;
+    c.type = CmdKnobs, c.def = id - 1;
+    for (uint32_t k = 0; k < LiveCount; ++k)
+        c.k[k] = gDefs[id - 1].knobs[k];
     push(c);
+}
+
+// New knob values for def i: live ones to the mixer, baked ones rendered again (in update, at most every 0.1 s).
+void setKnobs(uint32_t i, const float* values)
+{
+    Def& d = gDefs[i];
+    if (!memcmp(d.knobs, values, sizeof(d.knobs)))
+        return;
+    memcpy(d.knobs, values, sizeof(d.knobs));
+    sendKnobs(i + 1);
+    const float* now = d.bake ? d.bake->values : kBakedDefaults;
+    if (memcmp(now, &d.knobs[snd::kLive], sizeof(float) * kBaked))
+        d.bakeDirty = true;
 }
 
 // ---- The exports' calls (snd::Api) ----
@@ -754,9 +908,13 @@ uint32_t apiDefine(const snd::Spec* s, char* error, uint32_t errorBytes)
         return snprintf(error, errorBytes, "the Sound component isn't running"), 0;
     if (strlen(s->name) >= 64 || (s->options && strlen(s->options) >= 256))
         return snprintf(error, errorBytes, "its name or options are too long"), 0;
+    const char* version = s->version ? s->version : "";
+    if (strlen(version) >= 64)
+        return snprintf(error, errorBytes, "its version's name is too long"), 0;
     uint32_t variations = 0, intros = 0, outros = 0;
     uint64_t key = fnv(s->owner, strlen(s->owner));
     key = fnv(s->name, strlen(s->name) + 1, key);
+    key = fnv(version, strlen(version) + 1, key);
     key = fnv(s->options ? s->options : "", s->options ? strlen(s->options) : 0, key);
     for (uint32_t i = 0; i < s->fileCount; ++i)
     {
@@ -775,11 +933,10 @@ uint32_t apiDefine(const snd::Spec* s, char* error, uint32_t errorBytes)
     for (uint32_t i = 0; i < kDefs; ++i)
     {
         Def& d = gDefs[i];
-        if (d.used && !d.retired && d.key == key && !strcmp(d.owner, s->owner) && !strcmp(d.name, s->name))
+        if (d.used && !d.retired && d.key == key && !strcmp(d.owner, s->owner) && !strcmp(d.name, s->name) && !strcmp(d.version, version))
         {
-            d.confirmed = true;
-            if (d.volumeDb != s->volume || d.pitch != s->pitch)
-                d.volumeDb = s->volume, d.pitch = s->pitch, sendKnobs(i + 1);
+            d.confirmed = true, d.knobMask = s->knobMask;
+            setKnobs(i, s->knobs);
             return i + 1;
         }
         if (!d.used && fresh < 0)
@@ -802,12 +959,15 @@ uint32_t apiDefine(const snd::Spec* s, char* error, uint32_t errorBytes)
     }
     // A changed sound of the same name: its voices fade out and it goes once they have.
     for (uint32_t i = 0; i < kDefs; ++i)
-        if (gDefs[i].used && !gDefs[i].retired && !strcmp(gDefs[i].owner, s->owner) && !strcmp(gDefs[i].name, s->name))
+        if (gDefs[i].used && !gDefs[i].retired && !strcmp(gDefs[i].owner, s->owner) && !strcmp(gDefs[i].name, s->name) &&
+            !strcmp(gDefs[i].version, version))
             gDefs[i].retired = true, gOrderDirty = true, stopVoices(i, 0.02f);
     Def& d = gDefs[fresh];
     memset(&d, 0, sizeof(d));
     copy(d.owner, s->owner, sizeof(d.owner)), copy(d.name, s->name, sizeof(d.name)), copy(d.options, s->options, sizeof(d.options));
-    d.key = key, d.o = o, d.volumeDb = s->volume, d.pitch = s->pitch, d.lastPlay = -1e9, d.order = gOrderNext++;
+    copy(d.version, version, sizeof(d.version));
+    d.key = key, d.o = o, d.lastPlay = -1e9, d.order = gOrderNext++, d.knobMask = s->knobMask;
+    memcpy(d.knobs, s->knobs, sizeof(d.knobs));
     for (uint32_t i = 0; i < s->fileCount; ++i)
     {
         Clip* c = parts[i];
@@ -823,6 +983,8 @@ uint32_t apiDefine(const snd::Spec* s, char* error, uint32_t errorBytes)
     gOrderDirty = true;
     gDefVoices[fresh] = 0;
     sendKnobs(fresh + 1);
+    bool failed = false; // its renders now, so its first play is as tuned
+    d.bake = bakeFor(uint32_t(fresh), &d.knobs[snd::kLive], &failed), d.bakeDirty = failed;
     resume(fresh + 1);
     return fresh + 1;
 }
@@ -839,12 +1001,23 @@ void apiEnd(const char* owner)
     }
 }
 
-void apiKnobs(uint32_t sound, float volumeDb, float pitch)
+void apiKnobs(uint32_t sound, const float* values)
 {
-    if (!gLoaded || !sound || sound > kDefs || !gDefs[sound - 1].used)
+    if (!gLoaded || !values || !sound || sound > kDefs || !gDefs[sound - 1].used)
         return;
-    gDefs[sound - 1].volumeDb = volumeDb, gDefs[sound - 1].pitch = pitch;
-    sendKnobs(sound);
+    setKnobs(sound - 1, values);
+}
+
+void apiSet(snd::Voice v, const float* values)
+{
+    uint32_t slot;
+    if (!gLoaded || !values || !valid(v, &slot))
+        return;
+    Command c = {};
+    c.type = CmdLive, c.slot = slot, c.gen = gMirror[slot].gen;
+    for (uint32_t k = 0; k < LiveCount; ++k)
+        c.k[k] = values[k];
+    push(c);
 }
 
 void apiStop(snd::Voice v, uint32_t cut, float seconds)
@@ -961,26 +1134,15 @@ int apiInfo(uint32_t index, snd::Info* out)
     if (!gLoaded || !out || index >= gOrderCount)
         return 0;
     const Def& d = gDefs[gOrder[index]];
-    out->name = d.name, out->owner = d.owner, out->options = d.options;
-    out->id = gOrder[index] + 1, out->bus = d.o.bus;
+    out->name = d.name, out->owner = d.owner, out->options = d.options, out->version = d.version;
+    out->id = gOrder[index] + 1, out->bus = d.o.bus, out->of = 0, out->knobMask = d.knobMask;
+    for (uint32_t i = 0; d.version[0] && i < kDefs; ++i) // a version's sound, as it is now
+        if (gDefs[i].used && !gDefs[i].retired && !gDefs[i].version[0] && !strcmp(gDefs[i].owner, d.owner) && !strcmp(gDefs[i].name, d.name))
+            out->of = i + 1;
     out->flags = (d.o.loop ? 1 : 0) | (d.o.music ? 2 : 0) | (d.variations[0]->streamed ? 4 : 0);
     out->files = d.variationCount + (d.intro ? 1 : 0) + (d.outro ? 1 : 0);
     out->voices = uint32_t(std::max(0, gDefVoices[gOrder[index]].load(std::memory_order_relaxed)));
     return 1;
-}
-
-// A sound's files in order: its variations, then its intro, then its outro.
-const Clip* fileOf(const Def& d, uint32_t file, uint32_t* kind)
-{
-    if (file < d.variationCount)
-        return *kind = 0, d.variations[file];
-    file -= d.variationCount;
-    if (d.intro && file == 0)
-        return *kind = 1, d.intro;
-    file -= d.intro ? 1 : 0;
-    if (d.outro && file == 0)
-        return *kind = 2, d.outro;
-    return nullptr;
 }
 
 int apiWave(uint32_t sound, uint32_t file, snd::Wave* out)
@@ -993,26 +1155,55 @@ int apiWave(uint32_t sound, uint32_t file, snd::Wave* out)
         return 0;
     out->kind = kind, out->channels = c->channels, out->rate = c->rate, out->peaksReady = c->peaksReady;
     out->seconds = c->seconds, out->peaks = c->peaks;
+    const BakeSet* b = gDefs[sound - 1].bake;
+    if (b && file < kFiles && b->done[file])
+        out->seconds = b->seconds[file], out->peaks = b->peaks[file], out->peaksReady = 1;
     return 1;
 }
 
-snd::Voice apiPreview(uint32_t sound, uint32_t file)
+snd::Voice apiPreview(uint32_t sound, uint32_t file, float from, uint32_t flags)
 {
     if (!gLoaded || !gDevice || !sound || sound > kDefs || !gDefs[sound - 1].used)
         return 0;
     apiStop(gPreview, CutFade, 0.02f);
+    gPreview = 0;
     Def&        d = gDefs[sound - 1];
     uint32_t    kind = 0;
     const Clip* c = fileOf(d, file, &kind);
     const int   slot = freeSlot();
     if (!c || slot < 0)
         return 0;
-    // Played as a one-shot of that file alone: a variation in place, an intro or outro as the body.
-    Clip* const keep = d.variations[0];
-    d.variations[0] = (Clip*)c;
-    const snd::Voice v = start(sound, uint32_t(slot), nextGen(uint32_t(slot)), kind == 0 ? file : 0, FlagPreview, nullptr, 0, 0, 1, 0, 0);
-    d.variations[0] = keep;
-    return gPreview = v;
+    // That file alone, as its knobs make it, from `from`.
+    const Source   src = sourceOf(d, d.bake, file);
+    const uint32_t rate = src.buffer ? src.buffer->rate : c->rate;
+    const double   at = std::max(0.0, double(from)) * rate;
+    const uint32_t how = FlagPreview | ((flags & 1) ? FlagLoop : 0) | ((flags & 2) ? FlagHeld : 0);
+    return gPreview = start(sound, uint32_t(slot), nextGen(uint32_t(slot)), file, how, nullptr, 0, 0, 1, at, 0, d.bake, nullptr);
+}
+
+void apiHold(snd::Voice v, int on)
+{
+    uint32_t slot;
+    if (!gLoaded || !valid(v, &slot))
+        return;
+    Command c = {};
+    c.type = CmdHold, c.slot = slot, c.gen = gMirror[slot].gen, c.flags = on ? 1 : 0;
+    push(c);
+}
+
+void apiRepeat(snd::Voice v, int on)
+{
+    uint32_t slot;
+    if (!gLoaded || !valid(v, &slot))
+        return;
+    Command c = {};
+    c.type = CmdLoop, c.slot = slot, c.gen = gMirror[slot].gen, c.flags = on ? 1 : 0;
+    if (!push(c))
+        return;
+    const Clip* body = gDefs[gMirror[slot].def].used ? fileOf(gDefs[gMirror[slot].def], gMirror[slot].variation, &c.flags) : nullptr;
+    for (Decoding& dc : gDecoding) // a streamed one: its decoder goes round again, or stops at the end
+        if (body && dc.clip == body)
+            dc.loop = on != 0;
 }
 
 float apiPosition(snd::Voice v)
@@ -1021,9 +1212,101 @@ float apiPosition(snd::Voice v)
     return gLoaded && valid(v, &slot) ? gPosition[slot].load(std::memory_order_relaxed) : 0.0f;
 }
 
-snd::Api gApi = { snd::kApi,   sizeof(snd::Api), 0,          apiBegin,    apiDefine, apiEnd,   apiKnobs,   playDef,
-                  apiStop,     apiMove,          apiTune,    apiPlaying,  apiMusic,  apiListener, apiBus, apiCount,
-                  apiInfo,     apiWave,          apiPreview, apiPosition };
+snd::Api gApi = { snd::kApi, sizeof(snd::Api), 0,       apiBegin,    apiDefine,  apiEnd,   apiKnobs, playDef,    apiStop,
+                  apiMove,   apiTune,          apiPlaying, apiMusic,  apiListener, apiBus,  apiSet,  apiCount, apiInfo,    apiWave,
+                  apiPreview, apiPosition,     apiHold,    apiRepeat };
+
+// ---- Version 1 of snd::Api, for modules built before versions and knobs: their sounds play on ----
+
+namespace v1
+{
+struct Spec
+{
+    const char* owner;
+    const char* name;
+    const char* options;
+    const snd::File* files;
+    uint32_t    fileCount;
+    float       volume, pitch;
+};
+struct Play
+{
+    float    at[3];
+    uint32_t flags;
+    float    volume, pitch;
+};
+struct Info
+{
+    const char* name;
+    const char* owner;
+    const char* options;
+    uint32_t    id, bus, flags, files;
+    uint32_t    voices;
+};
+struct Api
+{
+    uint32_t version, size;
+    uint64_t instance;
+    void (*begin)(const char* owner);
+    uint32_t (*define)(const Spec* spec, char* error, uint32_t errorBytes);
+    void (*end)(const char* owner);
+    void (*knobs)(uint32_t sound, float volumeDb, float pitch);
+    snd::Voice (*play)(uint32_t sound, const Play* p);
+    void (*stop)(snd::Voice v, uint32_t cut, float seconds);
+    void (*move)(snd::Voice v, const float* at);
+    void (*tune)(snd::Voice v, float volumeDb, float pitch);
+    int (*playing)(snd::Voice v);
+    void (*music)(uint32_t sound);
+    void (*listener)(const float* at, const float* forward, const float* up);
+    void (*bus)(uint32_t bus, float volumeDb);
+    uint32_t (*count)(void);
+    int (*info)(uint32_t index, Info* out);
+    int (*wave)(uint32_t sound, uint32_t file, snd::Wave* out);
+    snd::Voice (*preview)(uint32_t sound, uint32_t file);
+    float (*position)(snd::Voice v);
+};
+void defaults(float* k, float volume, float pitch)
+{
+    for (uint32_t i = 0; i < snd::kKnobs; ++i)
+        k[i] = snd::kKnobSpecs[i].def;
+    k[snd::KnobVolume] = volume, k[snd::KnobPitch] = pitch;
+}
+uint32_t define(const Spec* s, char* error, uint32_t errorBytes)
+{
+    if (!s)
+        return 0;
+    snd::Spec n = { s->owner, s->name, "", s->options, s->files, s->fileCount, 1u << snd::KnobVolume | 1u << snd::KnobPitch, {} };
+    defaults(n.knobs, s->volume, s->pitch);
+    return apiDefine(&n, error, errorBytes);
+}
+void knobs(uint32_t sound, float volumeDb, float pitch)
+{
+    float k[snd::kKnobs];
+    if (!gLoaded || !sound || sound > kDefs || !gDefs[sound - 1].used)
+        return;
+    memcpy(k, gDefs[sound - 1].knobs, sizeof(k));
+    k[snd::KnobVolume] = volumeDb, k[snd::KnobPitch] = pitch;
+    apiKnobs(sound, k);
+}
+snd::Voice play(uint32_t sound, const Play* p)
+{
+    if (!p)
+        return playDef(sound, nullptr);
+    const snd::Play n = { { p->at[0], p->at[1], p->at[2] }, p->flags, p->volume, p->pitch, nullptr };
+    return playDef(sound, &n);
+}
+int info(uint32_t index, Info* out)
+{
+    snd::Info n;
+    if (!out || !apiInfo(index, &n))
+        return 0;
+    *out = Info{ n.name, n.owner, n.options, n.id, n.bus, n.flags, n.files, n.voices };
+    return 1;
+}
+snd::Voice preview(uint32_t sound, uint32_t file) { return apiPreview(sound, file, 0, 0); }
+Api gApi = { 1,        sizeof(Api), 0,       apiBegin,    define,   apiEnd, knobs, play,    apiStop, apiMove,
+             apiTune,  apiPlaying,  apiMusic, apiListener, apiBus,   apiCount, info, apiWave, preview, apiPosition };
+} // namespace v1
 
 // ---- The device ----
 
@@ -1093,6 +1376,30 @@ void collect()
     }
     if (gPendingCount && nowSeconds() > gPendingUntil)
         gPendingCount = 0;
+    // Renders no voice plays and no sound holds: gone after 30 s unused, or at once when their sound changed.
+    const double t = nowSeconds();
+    for (uint32_t i = 0; i < kBakeSets; ++i)
+    {
+        BakeSet* b = gBakes[i];
+        if (!b || b->users.load(std::memory_order_acquire) > 0)
+            continue;
+        const Def& d = gDefs[b->def];
+        if (d.bake != b && (t - b->lastUsed > 30.0 || !d.used || d.retired || d.key != b->defKey))
+            freeBake(i);
+    }
+    // Sounds whose baked knobs changed: rendered again (a few a frame, each at most every 0.1 s while dragged).
+    int budget = 4;
+    for (uint32_t i = 0; i < kDefs && budget > 0; ++i)
+    {
+        Def& d = gDefs[i];
+        if (!d.used || d.retired || !d.bakeDirty || t - d.bakeAt < 0.1)
+            continue;
+        bool     failed = false;
+        BakeSet* b = bakeFor(i, &d.knobs[snd::kLive], &failed);
+        if (!failed)
+            d.bake = b;
+        d.bakeDirty = failed, d.bakeAt = t, --budget;
+    }
 }
 
 void sendMix()
@@ -1129,6 +1436,9 @@ void clearAll()
     for (uint32_t i = 0; i < kClips; ++i)
         if (gClips[i])
             freeClip(i);
+    for (uint32_t i = 0; i < kBakeSets; ++i)
+        if (gBakes[i])
+            freeBake(i);
     memset(gDefs, 0, sizeof(gDefs));
     memset(gMirror, 0, sizeof(gMirror));
     memset(gListener, 0, sizeof(gListener));
@@ -1149,6 +1459,8 @@ uint64_t api(uint32_t version)
         return 0;
     if (version == 0)
         return 1; // running, whatever its version
+    if (version == 1)
+        return (uint64_t)(uintptr_t)&v1::gApi;
     return version == snd::kApi ? (uint64_t)(uintptr_t)&gApi : 0;
 }
 
@@ -1168,7 +1480,7 @@ int load(int)
         }
     Voices.clear();
     gPendingUntil = nowSeconds() + 5.0;
-    gApi.instance = (uint64_t)(nowSeconds() * 1e6) ^ (stamp() << 1);
+    gApi.instance = v1::gApi.instance = (uint64_t)(nowSeconds() * 1e6) ^ (stamp() << 1);
     // The device last: once its thread runs this module's code, nothing here may fail.
     gContextOpen = ma_context_init(nullptr, 0, nullptr, &gContext) == MA_SUCCESS;
     gDevice = gContextOpen && openDevice(true);

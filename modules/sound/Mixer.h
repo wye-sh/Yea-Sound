@@ -22,13 +22,17 @@ constexpr float    kRamp = 0.005f;    // the shortest fade: no click
 enum Bus : uint32_t { BusEffects, BusInterface, BusVoice, BusAmbience, BusMusic, BusCount };
 enum Cut : uint32_t { CutDefault, CutNow, CutFade, CutOutro, CutRelease };
 enum Switch : uint32_t { SwitchBar, SwitchBeat, SwitchNow, SwitchEnd };
+// The knobs the mixer applies live (the first five of snd::Knob): volume dB, pitch semitones, pan -1..1,
+// low-pass and high-pass amounts 0..1.
+enum Live : uint32_t { LiveVolume, LivePitch, LivePan, LiveLowpass, LiveHighpass, LiveCount };
 enum Flag : uint32_t
 {
     FlagLoop = 1,
     FlagMusic = 2,
     FlagAt = 4,      // positional
     FlagSting = 8,   // waits for the music's next beat
-    FlagPreview = 16 // plays through F1's Pause
+    FlagPreview = 16, // plays through F1's Pause
+    FlagHeld = 32     // starts held (CmdHold lets it go)
 };
 
 // Decoded frames, interleaved float. Never changed once a command names it.
@@ -77,6 +81,9 @@ enum : uint8_t
     CmdMaster,
     CmdMusicOff,
     CmdLeave, // every voice fades out fast, before the device stops (unload)
+    CmdLive,  // a voice's own live knobs (k: NaN keeps one)
+    CmdLoop,  // a voice loops its body, or stops looping (flags: 1 on); the editor's Repeat
+    CmdHold,  // a voice holds where it is, or plays on (flags: 1 held); the editor's pause
 };
 struct Command
 {
@@ -93,6 +100,8 @@ struct Command
     double   pos;             // frames into that segment
     double   issued;          // seconds (steady clock)
     Source   src[3];          // intro, body, outro
+    float    k[LiveCount];    // CmdKnobs: the sound's; CmdPlay, CmdLive: the voice's own (NaN: the sound's)
+    std::atomic<int>* users;  // CmdPlay: counts the voice while it holds src (a render's), else nullptr
 };
 bool push(const Command& c); // main thread; false when the ring is full
 
