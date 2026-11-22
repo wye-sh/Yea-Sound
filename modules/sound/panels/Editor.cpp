@@ -1,9 +1,10 @@
-// The Sound Editor: a panel in F1 (never in a release of the game). It lists every sound the view's game
-// declared, through the sound module's own registry (snd::Api's count and info), so a sound that can play
-// always shows. A press plays the selected file once on the Interface bus (snd::Api's preview: through Pause,
-// outside cooldown and limits); its waveform comes from the peaks the module keeps per file. Its Volume and
-// Pitch are the declaring module's own knobs. Add Sounds, and files dropped on the panel, go to the agents
-// through the chat: the panel never writes anything itself.
+// The Sound Editor: a panel in F1 (never in a release of the game). The sound edited first, in a dropdown of
+// every sound the view's game declared (its search inside it, a playing one's dot lit), through the sound module's
+// own registry (snd::Api's count and info), so a sound that can play always shows; right under it what is edited
+// about it: its files and waveform, Play, and its Volume and Pitch, the declaring module's own knobs; the
+// component's Mix after. A press plays the chosen file once on the Interface bus (snd::Api's preview: through
+// Pause, outside cooldown and limits); its waveform comes from the peaks the module keeps per file. Add Sounds (the
+// header's +), and files dropped on the panel, go to the agents through the chat: the panel never writes anything.
 #include "yea_sound.h"
 
 #include "../SoundLink.h"
@@ -19,17 +20,19 @@ namespace sound
 namespace
 {
 // What the panel keeps while it is open (wiped by a new version of this module, which only resets the choice).
-char       gSearch[64] = "";
-int        gBus = 0;     // 0 all, then snd::Bus + 1
 uint32_t   gSel = 0;     // the sound shown (its id), 0 none
 int        gFile = 0;    // its file shown
 snd::Voice gPlay = 0;    // the preview playing
 uint32_t   gPlayOf = 0;  // its sound
 int        gMix = 0;     // Mix folded open
 
-const char* const kBuses[] = { "All", "Effects", "Interface", "Voice", "Ambience", "Music" };
 const char* const kBusKnobs[] = { "effects", "interface", "voice", "ambience", "music" };
-const float       kSearchRow[2] = { 1.6f, 1.0f };
+constexpr uint32_t kMostSounds = 4096; // the dropdown's rows at most
+
+// The dropdown's rows, kept (no allocation): each sound's name, and its length and variations.
+YeaUiRow gRows[kMostSounds];
+uint32_t gIds[kMostSounds];
+char     gNames[kMostSounds][64], gRights[kMostSounds][32];
 
 // "engine_start": "Engine Start".
 void pretty(const char* in, char* out, size_t cap)
@@ -43,21 +46,6 @@ void pretty(const char* in, char* out, size_t cap)
         start = c == ' ';
     }
     out[n] = 0;
-}
-
-bool matches(const char* name)
-{
-    if (!gSearch[0])
-        return true;
-    for (const char* s = name; *s; ++s)
-    {
-        size_t i = 0;
-        while (gSearch[i] && s[i] && tolower((unsigned char)s[i]) == tolower((unsigned char)(gSearch[i] == ' ' ? '_' : gSearch[i])))
-            ++i;
-        if (!gSearch[i])
-            return true;
-    }
-    return false;
 }
 
 void seconds(float s, char* out, size_t cap) { snprintf(out, cap, s < 10.0f ? "%.2f s" : "%.0f s", s); }
@@ -102,55 +90,59 @@ void panel_sound_editor()
     const snd::Api* a = (const snd::Api*)(uintptr_t)api(snd::kApi);
     if (!u || !a)
         return;
-    u->row(2, kSearchRow);
-    u->field("##search", gSearch, sizeof(gSearch), "Search");
-    u->upload("Add Sounds", "");
-    gBus = u->tabs("##bus", kBuses, 6, gBus);
-    u->space(1);
+    u->add("Add Sounds", "");
 
-    // Every sound, in the order it was declared.
+    // Every sound, in the order it was declared, in one dropdown: the one edited first, what is edited about it under it.
     const uint32_t n = a->count();
-    bool           any = false, selShown = false;
+    uint32_t       rows = 0;
+    int            chosen = -1;
     snd::Info      sel = {};
-    for (uint32_t i = 0; i < n; ++i)
+    for (uint32_t i = 0; i < n && rows < kMostSounds; ++i)
     {
         snd::Info s;
-        if (!a->info(i, &s) || (gBus && s.bus + 1 != uint32_t(gBus)) || !matches(s.name))
+        if (!a->info(i, &s))
             continue;
         snd::Wave w = {};
-        char      name[64], label[96], right[32], len[16];
+        char      name[48], len[16];
         a->wave(s.id, 0, &w);
         pretty(s.name, name, sizeof(name));
-        snprintf(label, sizeof(label), "%s##%u", name, s.id);
+        snprintf(gNames[rows], sizeof(gNames[rows]), "%s##%u", name, s.id);
         seconds(w.seconds, len, sizeof(len));
         uint32_t variations = 0;
         for (uint32_t f = 0; f < s.files; ++f)
             variations += a->wave(s.id, f, &w) && w.kind == 0 ? 1 : 0;
         if (variations > 1)
-            snprintf(right, sizeof(right), "%u \xC3\x97 \xC2\xB7 %s", variations, len);
+            snprintf(gRights[rows], sizeof(gRights[rows]), "%u \xC3\x97 \xC2\xB7 %s", variations, len);
         else
-            snprintf(right, sizeof(right), "%s", len);
+            snprintf(gRights[rows], sizeof(gRights[rows]), "%s", len);
+        gRows[rows] = { gNames[rows], gRights[rows], s.voices > 0 };
+        gIds[rows] = s.id;
         if (!gSel)
             gSel = s.id;
-        if (u->item(label, right, s.id == gSel, s.voices > 0))
-            gSel = s.id, gFile = 0;
         if (s.id == gSel)
-            sel = s, selShown = true;
-        any = true;
+            chosen = int(rows), sel = s;
+        ++rows;
     }
-    if (!any)
+    if (!rows)
     {
-        u->label(n ? "No Matches" : "No Sounds Yet", 1);
+        u->label("No Sounds Yet", 1);
         return;
     }
-    if (!selShown)
+    const int picked = u->dropdown("##sound", gRows, int(rows), chosen);
+    if (picked != chosen && picked >= 0 && picked < int(rows))
+    {
+        gSel = gIds[picked], gFile = 0;
+        for (uint32_t i = 0; i < n; ++i) // the one picked, edited from this frame on
+            if (snd::Info s; a->info(i, &s) && s.id == gSel)
+                sel = s, chosen = picked;
+    }
+    if (chosen < 0) // the one shown went (its module stopped): the first
+    {
+        gSel = gIds[0], gFile = 0;
         return;
+    }
 
     // The sound chosen: its files, its waveform, Play, and its knobs.
-    char name[64];
-    pretty(sel.name, name, sizeof(name));
-    u->space(2);
-    u->heading(name);
     if (sel.files > 1)
     {
         const char* names[16];
