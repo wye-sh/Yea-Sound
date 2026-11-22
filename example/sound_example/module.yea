@@ -1,0 +1,47 @@
+# Sound's example view (component sound): every behaviour of the component on pads, with generated test sounds.
+module sound_example
+import sound u64 api(u32 version) = 0
+# The pads' state: kept across code reloads (its voices play on), dropped by Reset.
+table Demo none 1
+  u32 engine
+  u32 charge
+  u32 hum
+  u32 beacon_a
+  u32 beacon_b
+  u32 beacon_c
+  u32 walking
+  u32 music
+  float walk
+  float step_in
+  float2 listener
+  float orbit
+end
+category Sound
+setting float click_volume 0 -40 6
+setting float click_pitch 0 -12 12
+setting float jump_volume 0 -40 6
+setting float jump_pitch 0 -12 12
+setting float step_volume 0 -40 6
+setting float step_pitch 0 -12 12
+setting float coin_volume 0 -40 6
+setting float coin_pitch 0 -12 12
+setting float laser_volume 0 -40 6
+setting float laser_pitch 0 -12 12
+setting float boom_volume 0 -40 6
+setting float boom_pitch 0 -12 12
+setting float engine_volume 0 -40 6
+setting float engine_pitch 0 -12 12
+setting float charge_volume 0 -40 6
+setting float charge_pitch 0 -12 12
+setting float hum_volume 0 -40 6
+setting float hum_pitch 0 -12 12
+setting float beacon_volume 0 -40 6
+setting float beacon_pitch 0 -12 12
+setting float talk_volume 0 -40 6
+setting float talk_pitch 0 -12 12
+setting float calm_volume 0 -40 6
+setting float calm_pitch 0 -12 12
+setting float chase_volume 0 -40 6
+setting float chase_pitch 0 -12 12
+setting float win_volume 0 -40 6
+setting float win_pitch 0 -12 12

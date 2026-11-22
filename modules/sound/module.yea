@@ -1,0 +1,28 @@
+# Sound (component sound): the mixer under every sound a game plays. Games declare and play their sounds
+# through SoundLink.h and this module's one export; AGENTS.md beside the component says how.
+module sound
+export u64 api(u32 version)
+# Loops and music playing when this module's own code is swapped, resumed by the next version.
+table Voice none 256
+  u64 key
+  u32 handle
+  u32 seg
+  u32 variation
+  u32 flags
+  double pos
+  float3 at
+  float tune_db
+  float tune_pitch
+  u64 stamp
+  u64 frame
+  double time
+end
+category Mix
+setting float volume 0 -40 6
+setting float music 0 -40 6
+setting float effects 0 -40 6
+setting float interface 0 -40 6
+setting float voice 0 -40 6
+setting float ambience 0 -40 6
+# The Sound Editor (panels/Editor.cpp): every sound the view's game declared, to hear and tune; files for new ones go to the agents.
+panel Sound Editor 520x460

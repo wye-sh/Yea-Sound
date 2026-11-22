@@ -1,0 +1,20 @@
+[
+  {
+    "name": "miniaudio",
+    "version": "0.11.26",
+    "license": "Unlicense OR MIT-0",
+    "source": "https://github.com/mackron/miniaudio/tree/877ea4a7c2601c7b0f2a44e83dfac42e6470fea6",
+    "licenseUrl": "https://github.com/mackron/miniaudio/blob/877ea4a7c2601c7b0f2a44e83dfac42e6470fea6/LICENSE",
+    "usedBy": ["modules/sound/third_party/miniaudio/"],
+    "notice": "Copyright 2026 David Reid"
+  },
+  {
+    "name": "stb_vorbis",
+    "version": "1.25",
+    "license": "MIT OR Unlicense",
+    "source": "https://github.com/nothings/stb/blob/6b5799bae8a1fe3792691ef4b72ae26434c3e799/stb_vorbis.c",
+    "licenseUrl": "https://github.com/nothings/stb/blob/6b5799bae8a1fe3792691ef4b72ae26434c3e799/stb_vorbis.c#L5681-L5720",
+    "usedBy": ["modules/sound/third_party/stb_vorbis/"],
+    "notice": "Copyright (c) 2017 Sean Barrett"
+  }
+]
