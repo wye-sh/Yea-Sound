@@ -21877,6 +21877,18 @@ typedef struct ma_IMMDevice                                ma_IMMDevice;
 typedef struct ma_IActivateAudioInterfaceCompletionHandler ma_IActivateAudioInterfaceCompletionHandler;
 typedef struct ma_IActivateAudioInterfaceAsyncOperation    ma_IActivateAudioInterfaceAsyncOperation;
 #endif
+/*
+Yea's change to miniaudio (the Sound component): the audio session playback streams join. miniaudio passes
+NULL (each process's own session) and no session flags; the Sound component defines these to give its
+streams a cross-process session of a fixed GUID, which Windows' volume mixer keys by that GUID alone, not
+by the executable's path. Unchanged when left undefined.
+*/
+#ifndef MA_WASAPI_SESSION_GUID
+#define MA_WASAPI_SESSION_GUID NULL
+#endif
+#ifndef MA_WASAPI_SESSION_FLAGS
+#define MA_WASAPI_SESSION_FLAGS 0
+#endif
 typedef struct ma_IPropertyStore                           ma_IPropertyStore;
 typedef struct ma_IAudioClient                             ma_IAudioClient;
 typedef struct ma_IAudioClient2                            ma_IAudioClient2;
@@ -23740,6 +23752,9 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
     if (deviceType == ma_device_type_loopback) {
         streamFlags |= MA_AUDCLNT_STREAMFLAGS_LOOPBACK;
     }
+    if (deviceType == ma_device_type_playback) {
+        streamFlags |= MA_WASAPI_SESSION_FLAGS; /* Yea's change: see MA_WASAPI_SESSION_GUID. */
+    }
 
     result = ma_context_get_IAudioClient__wasapi(pContext, deviceType, pDeviceID, pData->loopbackProcessID, pData->loopbackProcessExclude, &pData->pAudioClient, &pDeviceInterface);
     if (result != MA_SUCCESS) {
@@ -23933,7 +23948,7 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
         */
         hr = E_FAIL;
         for (;;) {
-            hr = ma_IAudioClient_Initialize((ma_IAudioClient*)pData->pAudioClient, shareMode, streamFlags, bufferDuration, bufferDuration, (MA_WAVEFORMATEX*)&wf, NULL);
+            hr = ma_IAudioClient_Initialize((ma_IAudioClient*)pData->pAudioClient, shareMode, streamFlags, bufferDuration, bufferDuration, (MA_WAVEFORMATEX*)&wf, MA_WASAPI_SESSION_GUID);
             if (hr == MA_AUDCLNT_E_INVALID_DEVICE_PERIOD) {
                 if (bufferDuration > 500*10000) {
                     break;
@@ -23966,7 +23981,7 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
             #endif
 
                 if (SUCCEEDED(hr)) {
-                    hr = ma_IAudioClient_Initialize((ma_IAudioClient*)pData->pAudioClient, shareMode, streamFlags, bufferDuration, bufferDuration, (MA_WAVEFORMATEX*)&wf, NULL);
+                    hr = ma_IAudioClient_Initialize((ma_IAudioClient*)pData->pAudioClient, shareMode, streamFlags, bufferDuration, bufferDuration, (MA_WAVEFORMATEX*)&wf, MA_WASAPI_SESSION_GUID);
                 }
             }
         }
@@ -24029,7 +24044,7 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
                             MA_AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | MA_AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY must not be in the stream flags. If either of these are specified,
                             IAudioClient3_InitializeSharedAudioStream() will fail.
                             */
-                            hr = ma_IAudioClient3_InitializeSharedAudioStream(pAudioClient3, streamFlags & ~(MA_AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | MA_AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY), actualPeriodInFrames, (MA_WAVEFORMATEX*)&wf, NULL);
+                            hr = ma_IAudioClient3_InitializeSharedAudioStream(pAudioClient3, streamFlags & ~(MA_AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | MA_AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY), actualPeriodInFrames, (MA_WAVEFORMATEX*)&wf, MA_WASAPI_SESSION_GUID);
                             if (SUCCEEDED(hr)) {
                                 wasInitializedUsingIAudioClient3 = MA_TRUE;
                                 pData->periodSizeInFramesOut = actualPeriodInFrames;
@@ -24060,7 +24075,7 @@ static ma_result ma_device_init_internal__wasapi(ma_context* pContext, ma_device
         /* If we don't have an IAudioClient3 then we need to use the normal initialization routine. */
         if (!wasInitializedUsingIAudioClient3) {
             MA_REFERENCE_TIME bufferDuration = periodDurationInMicroseconds * pData->periodsOut * 10;   /* <-- Multiply by 10 for microseconds to 100-nanoseconds. */
-            hr = ma_IAudioClient_Initialize((ma_IAudioClient*)pData->pAudioClient, shareMode, streamFlags, bufferDuration, 0, (const MA_WAVEFORMATEX*)&wf, NULL);
+            hr = ma_IAudioClient_Initialize((ma_IAudioClient*)pData->pAudioClient, shareMode, streamFlags, bufferDuration, 0, (const MA_WAVEFORMATEX*)&wf, MA_WASAPI_SESSION_GUID);
             if (FAILED(hr)) {
                 if (hr == E_ACCESSDENIED) {
                     errorMsg = "[WASAPI] Failed to initialize device. Access denied.", result = MA_ACCESS_DENIED;

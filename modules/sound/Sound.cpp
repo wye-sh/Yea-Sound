@@ -22,6 +22,10 @@
 namespace sound
 {
 void nap(unsigned ms); // Codec.cpp
+#if defined(_WIN32)
+void sessionBegin();               // Session.cpp: the session Windows' mixer keeps its level under
+void sessionName(void* audioClient);
+#endif
 
 namespace
 {
@@ -1042,8 +1046,15 @@ bool openDevice(bool fresh)
     c.performanceProfile = ma_performance_profile_low_latency;
     c.noPreSilencedOutputBuffer = MA_TRUE; // render() writes every frame
     c.noClip = MA_TRUE;                    // the limiter does
+#if defined(_WIN32)
+    sessionBegin();
+#endif
     if (ma_device_init(&gContext, &c, &gDev) != MA_SUCCESS)
         return false;
+#if defined(MA_HAS_WASAPI)
+    if (gContext.backend == ma_backend_wasapi)
+        sessionName(gDev.wasapi.pAudioClientPlayback);
+#endif
     if (fresh)
         reset(gDev.sampleRate);
     else

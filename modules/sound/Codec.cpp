@@ -10,6 +10,8 @@
 #include "third_party/stb_vorbis/stb_vorbis.c"
 #pragma clang diagnostic pop
 
+const void* soundSession = nullptr;
+
 namespace sound
 {
 void nap(unsigned ms) { ma_sleep(ms); } // miniaudio's, on every platform
