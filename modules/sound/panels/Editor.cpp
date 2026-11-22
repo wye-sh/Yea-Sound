@@ -90,7 +90,7 @@ void panel_sound_editor()
     const snd::Api* a = (const snd::Api*)(uintptr_t)api(snd::kApi);
     if (!u || !a)
         return;
-    u->add("Add Sounds", "");
+    u->header("Add", "Add Sounds", ""); // pressed: the file picker, then the chat with this panel
 
     // Every sound, in the order it was declared, in one dropdown: the one edited first, what is edited about it under it.
     const uint32_t n = a->count();
