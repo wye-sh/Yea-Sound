@@ -17,12 +17,31 @@ table Voice none 256
   u64 frame
   double time
 end
-category Mix
+category Volume Mixer
 setting float volume 0 -40 6
 setting float music 0 -40 6
 setting float effects 0 -40 6
 setting float interface 0 -40 6
 setting float voice 0 -40 6
 setting float ambience 0 -40 6
+# Every sound's knobs (SoundLink.h's snd::kKnobSpecs, in Knob order): a module that imports this one gets them for each of
+# its SOUND lines (jump_volume), and for each version (talk_robot_volume), tuned only in the Sound Editor.
+each SOUND(name) SOUND_VERSION(name, version) SOUND_VERSION_FILES(name, version) panel Sound Editor
+category Sound
+setting float volume 0 -40 6
+setting float pitch 0 -12 12
+setting float pan 0 -1 1
+setting float lowpass 0 0 1
+setting float highpass 0 0 1
+setting float speed 1 0.5 2
+setting float bass 0 -12 12
+setting float treble 0 -12 12
+setting float echo 0 0 1
+setting float reverb 0 0 1
+setting float start 0 0 inf
+setting float end 0 0 inf
+setting float fade_in 0 0 inf
+setting float fade_out 0 0 inf
+end
 # The Sound Editor (panels/Editor.cpp): every sound the view's game declared, to hear and tune; files for new ones go to the agents.
 panel Sound Editor 520x460

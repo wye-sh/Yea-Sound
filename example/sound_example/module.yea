@@ -16,41 +16,10 @@ table Demo none 1
   float2 listener
   float orbit
 end
-category Sound
-setting float click_volume 0 -40 6
-setting float click_pitch 0 -12 12
-setting float jump_volume 0 -40 6
-setting float jump_pitch 0 -12 12
-setting float step_volume 0 -40 6
-setting float step_pitch 0 -12 12
-setting float coin_volume 0 -40 6
-setting float coin_pitch 0 -12 12
-setting float laser_volume 0 -40 6
-setting float laser_pitch 0 -12 12
-setting float boom_volume 0 -40 6
-setting float boom_pitch 0 -12 12
-setting float engine_volume 0 -40 6
-setting float engine_pitch 0 -12 12
-setting float charge_volume 0 -40 6
-setting float charge_pitch 0 -12 12
-setting float hum_volume 0 -40 6
-setting float hum_pitch 0 -12 12
-setting float beacon_volume 0 -40 6
-setting float beacon_pitch 0 -12 12
-setting float talk_volume 0 -40 6
-setting float talk_pitch 0 -12 12
-setting float talk_robot_volume 0 -40 6
-setting float talk_robot_pitch -4 -12 12
-setting float talk_robot_highpass 0.45 0 1
-setting float talk_robot_echo 0.35 0 1
-setting float talk_giant_volume 0 -40 6
-setting float talk_giant_pitch -7 -12 12
-setting float talk_giant_speed 0.8 0.5 2
-setting float talk_giant_bass 6 -12 12
-setting float talk_giant_reverb 0.6 0 1
-setting float calm_volume 0 -40 6
-setting float calm_pitch 0 -12 12
-setting float chase_volume 0 -40 6
-setting float chase_pitch 0 -12 12
-setting float win_volume 0 -40 6
-setting float win_pitch 0 -12 12
+default talk_robot_pitch -4
+default talk_robot_highpass 0.45
+default talk_robot_echo 0.35
+default talk_giant_pitch -7
+default talk_giant_speed 0.8
+default talk_giant_bass 6
+default talk_giant_reverb 0.6

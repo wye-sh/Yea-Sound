@@ -3,10 +3,9 @@
 //
 //   #include "../../components/sound/modules/sound/SoundLink.h"
 //
-// and needs, in its module.yea, `import sound u64 api(u32 version) = 0`, plus knobs per sound under
-// `category Sound`: <name>_volume (dB) and <name>_pitch (semitones) always, the others of snd::kKnobSpecs
-// when it uses them (named <name>_<suffix>). Sounds are declared inside the module's namespace, a
-// file each from its Sounds/ folder:
+// and needs, in its module.yea, `import sound u64 api(u32 version) = 0`. Each SOUND line gets every knob of
+// snd::kKnobSpecs from the sound module's each block (settings.<name>_<suffix>, tuned in the Sound Editor), with no
+// line of its own. Sounds are declared inside the module's namespace, a file each from its Sounds/ folder:
 //
 //   SOUND(jump, "max 4 cooldown 0.05")
 //   #embed "Sounds/jump.wav"
@@ -14,7 +13,7 @@
 //
 // SOUND_AND adds a variation (one is picked at random per play), SOUND_INTRO and SOUND_OUTRO a loop's intro
 // and outro (each followed by its #embed line). SOUND_VERSION(jump, big) adds a version: the same files
-// with knobs of its own (jump_big_volume, ...), played as snd::play(jump_big). Then snd::play(jump),
+// with knobs of its own (settings.jump_big_volume, ...), played as snd::play(jump_big). Then snd::play(jump),
 // snd::play(jump, pos), and the rest below. Call snd::update() once per update(): it brings the knobs to the
 // playing sounds.
 #pragma once
@@ -49,7 +48,7 @@ enum Knob : uint32_t
 constexpr uint32_t kLive = KnobSpeed; // the first baked one
 struct KnobSpec
 {
-    const char* suffix; // the setting is <sound>_<suffix> (a version's: <sound>_<version>_<suffix>)
+    const char* suffix; // the setting is <sound>_<suffix> (a version's: <sound>_<version>_<suffix>), as module.yea's each block makes it
     const char* title;
     float       def, min, max; // max 0: open-ended
 };
@@ -192,7 +191,7 @@ struct Sound
     const char*         version; // "" the sound, else this version's name
     const Sound*        of;      // a version's sound, else nullptr
     const char*         options;
-    const float* const* knob;    // kKnobs settings (nullptr: not declared, its default)
+    const float* const* knob;    // its kKnobs settings
     const char*         file;    // where it was declared: its module's folder names its owner
     uint32_t            id = 0;
     float               sent[kKnobs] = {};
@@ -203,7 +202,7 @@ struct Sound
         next = detail::gSounds, detail::gSounds = this;
     }
     Sound(const Sound&) = delete;
-    float value(uint32_t k) const { return knob[k] ? *knob[k] : kKnobSpecs[k].def; }
+    float value(uint32_t k) const { return *knob[k]; }
 };
 
 namespace detail
@@ -244,7 +243,7 @@ inline void define(const Api* a, Sound* s, const char* owner)
         }
         Spec spec = { owner, s->name, s->version, s->options, files, n, 0, {} };
         for (uint32_t k = 0; k < kKnobs; ++k)
-            spec.knobs[k] = s->sent[k] = s->value(k), spec.knobMask |= s->knob[k] ? 1u << k : 0u;
+            spec.knobs[k] = s->sent[k] = s->value(k), spec.knobMask |= 1u << k;
         char error[200] = "";
         s->id = a->define(&spec, error, sizeof(error));
         if (!s->id)
@@ -289,24 +288,14 @@ inline const Api* api()
 #define SND_OPEN(k) namespace SND_CAT(file_, __LINE__) { static const uint32_t kKind = k; static const unsigned char bytes[] = {
 #define SND_CLOSE }; static ::snd::detail::AddPart part(&sound, kKind, bytes, sizeof bytes); }
 
-namespace detail
-{
-template<class... F> struct Over : F...
-{
-    using F::operator()...;
-};
-template<class... F> Over(F...) -> Over<F...>;
-} // namespace detail
-// settings.<m> when the module declared it, else nullptr (the knob's default).
-#define SND_OPT(m) ::snd::detail::Over{ [](auto& s, int) -> decltype(&s.m) { return &s.m; }, [](auto&, long) -> const float* { return nullptr; } }(settings, 0)
-// A sound's knob settings, in Knob order: volume and pitch must exist, the others may.
-#define SND_KNOBS(p)                                                                                                \
-    { &settings.p##_volume, &settings.p##_pitch, SND_OPT(p##_pan), SND_OPT(p##_lowpass), SND_OPT(p##_highpass),      \
-      SND_OPT(p##_speed), SND_OPT(p##_bass), SND_OPT(p##_treble), SND_OPT(p##_echo), SND_OPT(p##_reverb),             \
-      SND_OPT(p##_start), SND_OPT(p##_end), SND_OPT(p##_fade_in), SND_OPT(p##_fade_out) }
+// A sound's knob settings, in Knob order, as the sound module's each block makes them for its SOUND line.
+#define SND_KNOBS(p)                                                                                                   \
+    { &settings.p##_volume, &settings.p##_pitch, &settings.p##_pan, &settings.p##_lowpass, &settings.p##_highpass,      \
+      &settings.p##_speed, &settings.p##_bass, &settings.p##_treble, &settings.p##_echo, &settings.p##_reverb,          \
+      &settings.p##_start, &settings.p##_end, &settings.p##_fade_in, &settings.p##_fade_out }
 
 // SOUND(name, "options"), then each file's #embed line, then SOUND_END. The handle is `name`; its knobs are
-// settings.name_volume, settings.name_pitch (both must exist) and the others it declares.
+// settings.name_volume and the rest of kKnobSpecs.
 #define SOUND(name, options)                                                                                       \
     namespace name##_sound { extern ::snd::Sound sound; }                                                          \
     ::snd::Sound& name = name##_sound::sound;                                                                      \

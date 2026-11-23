@@ -7,7 +7,7 @@ Sound effects and music for any game. Module `sound` (the mixer); example view m
 - Every sound a game plays is a file in a module's `Sounds/` folder, declared with `SOUND` (below) and played through `SoundLink.h`. Never play audio any other way, never add another audio library, and never keep sound files anywhere else.
 - Sound belongs to its view: it plays only while the view is current and stops when the view is left or Reset (kit rule 11). This is automatic: nothing to code.
 - Files: Ogg Vorbis (`.ogg`), WAV or FLAC. Never MP3: its padding breaks loops. A loop's file must loop seamlessly by itself.
-- Files sent to the Sound Editor (the chat's "Panel pressed: Sound Editor"): each becomes a sound of the game's module that plays it, in its `Sounds/`, with its `SOUND` line and its Volume and Pitch knobs (an MP3 or other format converted to `.ogg`; a zip's files each; a variation of a sound already there: `SOUND_AND`). From a view without the Sound feature, first give the view its Sound feature (a link module, below), then add the sound to the module that plays it. When which module, or what the sound is for, isn't clear, ask the orchestrator. Never keep a file the editor can't list: `yea publish` warns of one no `SOUND` line embeds.
+- Files sent to the Sound Editor (the chat's "Panel pressed: Sound Editor"): each becomes a sound of the game's module that plays it, in its `Sounds/`, with its `SOUND` line, which brings its knobs (an MP3 or other format converted to `.ogg`; a zip's files each; a variation of a sound already there: `SOUND_AND`). From a view without the Sound feature, first give the view its Sound feature (a link module, below), then add the sound to the module that plays it. When which module, or what the sound is for, isn't clear, ask the orchestrator. Never keep a file the editor can't list: `yea publish` warns of one no `SOUND` line embeds.
 - Sounds someone else made are licensed assets (kit rules 12 and 13). Placeholders: `tools/sounds.py` makes them from nothing (`python3 components/sound/tools/sounds.py list`), with no licence needed.
 
 ## Hooking it up
@@ -17,9 +17,6 @@ Sound effects and music for any game. Module `sound` (the mixer); example view m
 
 ```
 import sound u64 api(u32 version) = 0
-category Sound
-setting float jump_volume 0 -40 6
-setting float jump_pitch 0 -12 12
 ```
 
   and its code, inside the module's namespace:
@@ -46,8 +43,8 @@ void update(uint32_t phase, float dt)
 ```
 
 - Each sound: `SOUND(name, "options")`, one `#embed "Sounds/<file>"` line per file, `SOUND_END`. More files: `SOUND_AND` before each further variation, `SOUND_INTRO` and `SOUND_OUTRO` before a loop's intro and outro (main file first). The handle is `name`; in another `.cpp` of the module, `extern snd::Sound& name;`.
-- Every sound needs its `<name>_volume` and `<name>_pitch` knobs under `category Sound`: it doesn't compile without them. Any other knob below is added the same way (`setting float jump_echo 0 0 1`) when the sound needs it; the sound finds it by its name. Make Default writes them back to these lines.
-- Versions: `SOUND_VERSION(talk, robot)` after `talk`'s `SOUND_END` is the same sound with knobs of its own (`talk_robot_volume`, `talk_robot_pitch` and any others), played with `snd::play(talk_robot)`: one per character's voice, one per weapon's mod. The game picks a version; `SOUND_AND`'s variations are picked at random per play. A version edited as a file of its own: `SOUND_VERSION_FILES(talk, robot)`, its `#embed` lines, `SOUND_END`. The editor lists versions under their sound.
+- Every sound has every knob below from its `SOUND` line alone (the sound module's `each` block makes them: `settings.jump_volume` and the rest), tuned in the Sound Editor, not the feature's settings. Never write a `setting` line for them: yeagen refuses one with a knob's name, so a module's own setting can't be named `<sound>_<knob>` either. A changed default is a `default jump_volume -6` line in the module's `module.yea`, which Make Default asks for.
+- Versions: `SOUND_VERSION(talk, robot)` after `talk`'s `SOUND_END` is the same sound with knobs of its own (`talk_robot_volume` and the rest), played with `snd::play(talk_robot)`: one per character's voice, one per weapon's mod. The game picks a version; `SOUND_AND`'s variations are picked at random per play. A version edited as a file of its own: `SOUND_VERSION_FILES(talk, robot)`, its `#embed` lines, `SOUND_END`. The editor lists versions under their sound.
 - Call `snd::update()` once per update: it registers the module's sounds (again whenever the component restarts) and sends knob changes.
 - The import is optional (`= 0`): in a view without the Sound feature, the module runs silently.
 
@@ -95,6 +92,8 @@ The defaults suit most sounds: write only what differs.
 
 ## Knobs per sound
 
+Every sound and version has them all, named `<name>_<setting>` (a version's: `<name>_<version>_<setting>`).
+
 | Knob | Setting | Range | Applied |
 | --- | --- | --- | --- |
 | Volume | `<name>_volume` | dB, -40 to 6 | live |
@@ -112,10 +111,10 @@ Live knobs change a playing sound at once and cost nothing. Baked ones render th
 
 ## The rest
 
-- Knobs: `volume` (master, dB) and one per bus (`music`, `effects`, `interface`, `voice`, `ambience`), under Mix; each sound's own (above).
+- Knobs: `volume` (master, dB) and one per bus (`music`, `effects`, `interface`, `voice`, `ambience`), under Volume Mixer; each sound's own (above).
 - Reset: every sound stops; nothing is kept.
 - F1's Pause holds every sound where it is.
 - A change to the game's code keeps playing sounds playing; a sound whose line or files changed fades out and the next play uses the new one. A change to this component's own code fades everything out for a moment and resumes loops and music where they were.
 - Cost: nothing per frame while silent; 64 sounds mixed at once, 256 tracked. Decoded sounds stay in memory while their view runs; music streams.
-- The Sound Editor (panel, `modules/sound/panels/Editor.cpp`): a dropdown of every sound of the view in the order declared, its search inside; under it the chosen sound's version (a dropdown, when it has versions), its files and waveform (a press seeks), the transport (Back to Start, Play and Pause, Repeat: a preview on Interface, through Pause), and the knobs its module declared for that version; then the component's Mix. Add Sounds is its header + (`header`), which sends files to the agents. Its header gear, More Knobs, sends `yea::send("Sound Editor: More Knobs", {"module", "sound", "version", "knobs": [suffixes]})`: add those `setting` lines (ranges above) to that module's `module.yea` under `category Sound`, rebuild and publish it. It reads `snd::Api`'s `count`, `info`, `wave`, `preview`, `position`, `hold` and `repeat`.
+- The Sound Editor (panel, `modules/sound/panels/Editor.cpp`): a dropdown of every sound of the view in the order declared, its search inside; under it the chosen sound's version (a dropdown, when it has versions), its files and waveform (a press seeks), the transport (Back to Start, Play and Pause, Repeat: a preview on Interface, through Pause), and under the sound's name its knobs for that version (the live ones, then Effects and Trim and Fade folded); then the component's Volume Mixer, for every sound. Add Sounds is its header + (`header`), which sends files to the agents. It reads `snd::Api`'s `count`, `info`, `wave`, `preview`, `position`, `hold` and `repeat`.
 - Example view: `sound_example`, pads for every behaviour and a listener with sources around it.

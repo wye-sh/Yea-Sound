@@ -1,7 +1,7 @@
 {
  "name": "sound",
  "title": "Sound",
- "version": "2.0.1",
+ "version": "3.0.0",
  "source": "https://github.com/wye-sh/Yea-Sound",
  "summary": "Sound effects and music for any game: variations, limits, loops with an intro and outro, clean cut-offs, buses with ducking, music that changes on the bar, and sounds placed in 3D.",
  "type": "Audio",

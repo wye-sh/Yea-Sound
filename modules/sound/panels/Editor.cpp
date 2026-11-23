@@ -2,10 +2,10 @@
 // every sound the view's game declared (its search inside it, a playing one's dot lit), through the sound module's
 // own registry (snd::Api's count and info), so a sound that can play always shows; then its version (a dropdown,
 // when it has versions), its files and waveform, the transport (back to start, play and pause, repeat; a press on
-// the waveform seeks), and the knobs its module declared for that version; the component's Mix after. The preview
-// plays the chosen file alone on the Interface bus, as its knobs make it (snd::Api's preview: through Pause,
-// outside cooldown and limits). Add Sounds (the header's +), files dropped on the panel, and More Knobs (the header's gear) go to
-// the agents: the panel never writes anything.
+// the waveform seeks), and under the sound's name every knob it has for that version (the baked ones folded); the
+// component's Volume Mixer after, for every sound. The preview plays the chosen file alone on the Interface bus, as its
+// knobs make it (snd::Api's preview: through Pause, outside cooldown and limits). Add Sounds (the header's +) and files
+// dropped on the panel go to the agents: the panel never writes anything.
 #include "yea_sound.h"
 
 #include "../SoundLink.h"
@@ -30,7 +30,9 @@ int        gHeld = 0;    // the preview paused
 int        gRepeat = 0;  // the preview repeats
 float      gFrom = 0;    // where the next play starts (seconds): a seek while stopped
 uint32_t   gVersion = 0; // the version shown (its id), 0 the sound itself
-int        gMix = 0;     // Mix folded open
+int        gMix = 0;     // Volume Mixer folded open
+int        gEffects = 0; // the sound's Effects folded open
+int        gTrim = 0;    // its Trim and Fade folded open
 YeaUiRow   gVersionRows[64];
 uint32_t   gVersionIds[64];
 char       gVersionNames[64][64];
@@ -261,32 +263,45 @@ void panel_sound_editor()
     snprintf(pos, sizeof(pos), "%s / %s", now, len);
     u->label(pos, 1);
 
-    // Its knobs, as its module declared them for this version; the others it could have go to the agents.
-    char     base[96], knob[160], missing[512] = "";
-    uint32_t more = 0;
+    // Its knobs for this version, under its name (every sound has them all: the sound module's each block): the live
+    // ones open, the baked ones in two folds. A module built before has only those it declared then.
+    char base[96], knob[160], title[112];
     snprintf(base, sizeof(base), "%s.%s%s%s", ed.owner, ed.name, ed.version[0] ? "_" : "", ed.version);
-    u->space(1);
-    for (uint32_t k = 0; k < snd::kKnobs; ++k)
+    pretty(ed.name, title, sizeof(title));
+    if (ed.version[0])
     {
-        if (ed.knobMask & (1u << k))
-        {
-            snprintf(knob, sizeof(knob), "%s##%s_%s", snd::kKnobSpecs[k].title, base, snd::kKnobSpecs[k].suffix);
-            u->knob(knob);
-        }
-        else if (strlen(missing) + 24 < sizeof(missing))
-            snprintf(missing + strlen(missing), sizeof(missing) - strlen(missing), "%s\"%s\"", more++ ? "," : "", snd::kKnobSpecs[k].suffix);
+        const size_t at = strlen(title);
+        snprintf(title + at, sizeof(title) - at, " \xC2\xB7 ");
+        pretty(ed.version, title + strlen(title), sizeof(title) - strlen(title));
     }
-    if (more && u->header("Settings", "More Knobs", nullptr)) // the others it could have: asked of the agents
+    u->space(1);
+    u->heading(title);
+    auto knobs = [&](uint32_t from, uint32_t to) {
+        for (uint32_t k = from; k < to; ++k)
+            if (ed.knobMask & (1u << k))
+            {
+                snprintf(knob, sizeof(knob), "%s##%s_%s", snd::kKnobSpecs[k].title, base, snd::kKnobSpecs[k].suffix);
+                u->knob(knob);
+            }
+    };
+    auto any = [&](uint32_t from, uint32_t to) { return (ed.knobMask & (((1u << to) - 1u) & ~((1u << from) - 1u))) != 0; };
+    knobs(0, snd::kLive);
+    if (any(snd::kLive, snd::KnobStart))
     {
-        char json[1024];
-        snprintf(json, sizeof(json), "{\"module\":\"%s\",\"sound\":\"%s\",\"version\":\"%s\",\"knobs\":[%s]}", ed.owner, ed.name, ed.version,
-                 missing);
-        yea::send("Sound Editor: More Knobs", json);
+        u->fold("Effects", &gEffects);
+        if (gEffects)
+            knobs(snd::kLive, snd::KnobStart);
+    }
+    if (any(snd::KnobStart, snd::kKnobs))
+    {
+        u->fold("Trim and Fade", &gTrim);
+        if (gTrim)
+            knobs(snd::KnobStart, snd::kKnobs);
     }
 
-    // The component's own mix: the master volume and each bus.
+    // The component's own mix, for every sound: the master volume and each bus.
     u->space(2);
-    u->fold("Mix", &gMix);
+    u->fold("Volume Mixer", &gMix);
     if (gMix)
     {
         u->knob("Volume##volume");
