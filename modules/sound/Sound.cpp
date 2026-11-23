@@ -36,6 +36,7 @@ constexpr uint32_t kClips = 2048;
 constexpr uint32_t kVariations = 32;
 constexpr uint32_t kPeaks = 256;
 constexpr float    kStreamSeconds = 10.0f; // files this long or longer stream; shorter ones are decoded whole
+constexpr uint64_t kTopUp = 16384;       // stream frames decoded per call at most (0.34 s at 48 kHz; called twice a frame)
 
 double nowSeconds() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -65,6 +66,7 @@ struct Clip
     float          seconds;
     float          peaks[kPeaks * 2];
     bool           peaksReady;
+    mutable bool   peaksWanted; // a panel asked for its waveform (apiWave): only then is a streamed one scanned
 };
 Clip* gClips[kClips];
 
@@ -537,16 +539,20 @@ void topUp(uint32_t i)
     }
     if (s != StreamReady || !dc.open)
         return;
-    for (int guard = 0; guard < 64; ++guard)
+    // At most kTopUp frames a call, so a track's start fills its ring over a few frames rather than decoding
+    // all of it in one; two calls a frame stay far ahead of what plays.
+    uint64_t budget = kTopUp;
+    for (int guard = 0; guard < 64 && budget > 0; ++guard)
     {
         const uint64_t w = st.written.load(std::memory_order_relaxed), r = st.read.load(std::memory_order_acquire);
         const uint64_t room = kRing - (w - r);
         if (room < 1024 || st.ended.load() != ~0ull)
             break;
         const uint64_t at = w % kRing;
-        const uint64_t n = std::min<uint64_t>(std::min<uint64_t>(room, kRing - at), 8192);
+        const uint64_t n = std::min<uint64_t>(std::min<uint64_t>(room, kRing - at), budget);
         ma_uint64      got = 0;
         ma_decoder_read_pcm_frames(&dc.decoder, &st.frames[at * st.channels], n, &got);
+        budget -= got;
         st.written.store(w + got, std::memory_order_release);
         if (got < n)
         {
@@ -565,7 +571,7 @@ void topUp(uint32_t i)
     }
 }
 
-// A streamed clip's peaks, a little each frame.
+// A streamed clip's peaks, a little each frame, once a panel asked for them.
 struct Scan
 {
     Clip*      clip;
@@ -578,7 +584,7 @@ void scanPeaks()
     if (!gScan.clip)
     {
         for (uint32_t i = 0; i < kClips && !gScan.clip; ++i)
-            if (gClips[i] && gClips[i]->streamed && !gClips[i]->peaksReady && gClips[i]->refs > 0)
+            if (gClips[i] && gClips[i]->streamed && !gClips[i]->peaksReady && gClips[i]->peaksWanted && gClips[i]->refs > 0)
             {
                 Clip* c = gClips[i];
                 if (!openDecoder(c->bytes, c->size, c->channels, &gScan.decoder))
@@ -1154,6 +1160,7 @@ int apiWave(uint32_t sound, uint32_t file, snd::Wave* out)
     if (!c)
         return 0;
     out->kind = kind, out->channels = c->channels, out->rate = c->rate, out->peaksReady = c->peaksReady;
+    c->peaksWanted = true;
     out->seconds = c->seconds, out->peaks = c->peaks;
     const BakeSet* b = gDefs[sound - 1].bake;
     if (b && file < kFiles && b->done[file])
